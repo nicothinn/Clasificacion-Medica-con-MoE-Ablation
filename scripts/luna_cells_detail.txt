@@ -1,0 +1,773 @@
+
+================================================================================
+=== CELL 4 (code) ===
+================================================================================
+# Fase 2: Leer CSVs que ya vienen en el zip (no generamos ningún CSV en disco)
+# - annotations.csv: referencia de detección (coords mundo, diámetro)
+# - candidates_V2.csv: track FP reduction (class 0 = no-nódulo, 1 = nódulo)
+# Etiquetas binarias del challenge (candidatos); no es malignidad LIDC aparte; aquí usamos
+# las etiquetas del challenge oficial en candidates_V2 cuando exista.
+
+def _normalize_luna_columns(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in df.columns}
+    ren = {}
+    if 'seriesuid' not in lower and 'seriesinstanceuid' in lower:
+        ren[lower['seriesinstanceuid']] = 'seriesuid'
+    for a, b in [('coordx', 'coordX'), ('coordy', 'coordY'), ('coordz', 'coordZ')]:
+        if a in lower and b not in lower:
+            ren[lower[a]] = b
+    for old, new in ren.items():
+        df = df.rename(columns={old: new})
+    return df
+
+ann_path = os.path.join(LUNA_BASE, 'annotations.csv')
+if not os.path.isfile(ann_path):
+    ann_path = next((c for c in csv_files if 'annotations' in os.path.basename(c).lower()
+                     and 'excluded' not in os.path.basename(c).lower()), None)
+
+cand_path = os.path.join(LUNA_BASE, 'candidates_V2.csv')
+if not os.path.isfile(cand_path):
+    cand_path = next((c for c in csv_files if 'candidates_v2' in os.path.basename(c).lower()), None)
+if cand_path is None or not os.path.isfile(str(cand_path)):
+    cand_path = next((c for c in csv_files if 'candidates' in os.path.basename(c).lower()), None)
+
+print(f"annotations.csv: {ann_path}")
+print(f"candidates CSV:  {cand_path}")
+
+annotations = pd.read_csv(ann_path) if ann_path and os.path.isfile(str(ann_path)) else pd.DataFrame()
+if len(annotations) > 0:
+    annotations = _normalize_luna_columns(annotations)
+print(f"Filas en annotations (referencia detección): {len(annotations)}")
+if len(annotations) > 0:
+    print(annotations.head())
+
+uid_to_mhd = {}
+for mhd in mhd_files:
+    uid = os.path.splitext(os.path.basename(mhd))[0]
+    uid_to_mhd[uid] = mhd
+
+if cand_path is not None and os.path.isfile(str(cand_path)):
+    candidates = pd.read_csv(cand_path)
+    candidates = _normalize_luna_columns(candidates)
+    candidates['class'] = pd.to_numeric(candidates['class'], errors='coerce').fillna(0).astype(int)
+    print(f"\nCandidates (desde zip) shape: {candidates.shape}")
+    print(candidates.head())
+    nodules = candidates[candidates['class'] == 1].copy()
+    non_nodules = candidates[candidates['class'] == 0].copy()
+    max_neg = min(len(non_nodules), len(nodules) * 2)
+    non_nodules = non_nodules.sample(n=max_neg, random_state=SEED)
+    df_labels = pd.concat([nodules, non_nodules], ignore_index=True)
+    df_labels = df_labels.rename(columns={'class': 'label'})
+elif len(annotations) > 0:
+    df_labels = annotations.copy()
+    df_labels['label'] = 1
+    print("AVISO: no hay candidates*.csv; usando solo annotations (todos label=1).")
+else:
+    raise FileNotFoundError("No se encontraron CSV dentro del dataset descomprimido.")
+
+df_labels['mhd_path'] = df_labels['seriesuid'].astype(str).map(uid_to_mhd)
+df_labels = df_labels.dropna(subset=['mhd_path'])
+
+df_labels['group_id'] = df_labels['seriesuid'].astype(str)
+
+print(f"\nMuestras listas para entrenamiento: {len(df_labels)}")
+print(f"Distribución de label:\n{df_labels['label'].value_counts()}")
+print(f"Series únicas (group_id): {df_labels['group_id'].nunique()}")
+
+
+
+================================================================================
+=== CELL 5 (code) ===
+================================================================================
+# Fase 3: Dataset — volumen COMPLETO → resample 1 mm, HU, [0,1] → trilineal a 64³
+import torch.nn.functional as F
+
+VOL_SIZE = (64, 64, 64)
+HU_MIN, HU_MAX = -1000.0, 400.0
+
+
+def extract_full_volume_64_np(row):
+    """TAC completo: resample isotrópico 1 mm, ventana HU, min-max [0,1], resize trilineal a 64³. Shape (64,64,64) float32."""
+    mhd_path = row['mhd_path']
+    try:
+        img = sitk.ReadImage(mhd_path)
+        orig_spacing = np.array(img.GetSpacing())
+        orig_size = np.array(img.GetSize())
+        new_spacing = np.array([1.0, 1.0, 1.0])
+        new_size = (orig_size * orig_spacing / new_spacing).astype(int).tolist()
+
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetOutputSpacing(new_spacing.tolist())
+        resampler.SetSize(new_size)
+        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetOutputOrigin(img.GetOrigin())
+        resampler.SetOutputDirection(img.GetDirection())
+        img = resampler.Execute(img)
+
+        vol = sitk.GetArrayFromImage(img).astype(np.float32)
+        vol = np.clip(vol, HU_MIN, HU_MAX)
+        vol = (vol - HU_MIN) / (HU_MAX - HU_MIN)
+
+        t = torch.from_numpy(vol).float().unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=VOL_SIZE, mode='trilinear', align_corners=False)
+        out = t.squeeze(0).squeeze(0).numpy().astype(np.float32)
+        return np.ascontiguousarray(out)
+    except Exception as e:
+        print(f"Error cargando {mhd_path}: {e}")
+        return np.zeros(VOL_SIZE, dtype=np.float32)
+
+
+class LUNA16NoduleDataset(Dataset):
+    def __init__(self, df, augment=False):
+        self.records = df.reset_index(drop=True)
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        row = self.records.iloc[idx]
+        label = int(row['label'])
+        vol = extract_full_volume_64_np(row)
+        tensor = torch.from_numpy(np.ascontiguousarray(vol)).unsqueeze(0)
+
+        if self.augment:
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[1])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[2])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[3])
+
+        return tensor, label
+
+# Test rápido
+_test_ds = LUNA16NoduleDataset(df_labels.head(2))
+_t, _l = _test_ds[0]
+print(f"Test shape: {_t.shape}, label: {_l}, min={_t.min():.3f}, max={_t.max():.3f}")
+
+
+
+================================================================================
+=== CELL 6 (code) ===
+================================================================================
+# Fase 3B: Materializar volúmenes 64³ (volumen completo) en disco + dataset que solo lee .npz
+
+VOL_CACHE_DIR = os.path.join(LOCAL_DEST, 'Luna16_fullvol_64_cache_v2')
+FORCE_REBUILD_VOL_CACHE = False  # True para regenerar todo el caché
+
+
+def materialize_vol_cache(df_labels, cache_dir, force=False):
+    """Escribe vol_{idx:06d}.npz con Z (64,64,64) y y (escalar), idx = posición en df_labels."""
+    os.makedirs(cache_dir, exist_ok=True)
+    n = len(df_labels)
+    for idx in tqdm(range(n), desc='Materializando vol 64³ cache'):
+        out_path = os.path.join(cache_dir, f'vol_{idx:06d}.npz')
+        if os.path.isfile(out_path) and not force:
+            continue
+        row = df_labels.iloc[idx]
+        vol = extract_full_volume_64_np(row)
+        np.savez_compressed(
+            out_path,
+            Z=vol.astype(np.float32),
+            y=np.int64(int(row['label'])),
+        )
+    meta = {
+        'version': 'v2_fullvol_64',
+        'n_rows': n,
+        'vol_shape': list(VOL_SIZE),
+        'pipeline': 'full_volume_resample1mm_hu_trilinear64',
+    }
+    with open(os.path.join(cache_dir, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f"Caché listo: {cache_dir} ({n} volúmenes 64³)")
+
+
+def vol_cache_matches_df(cache_dir, n_expected):
+    p = os.path.join(cache_dir, 'meta.json')
+    if not os.path.isfile(p):
+        return False
+    with open(p) as f:
+        m = json.load(f)
+    if int(m.get('n_rows', -1)) != int(n_expected):
+        return False
+    if m.get('version') != 'v2_fullvol_64':
+        return False
+    return True
+
+
+class LUNA16CachedVolumeDataset(Dataset):
+    """Subconjunto por índices globales en df_labels; archivos vol_{global_idx}.npz."""
+
+    def __init__(self, df_full, index_array, cache_dir, augment=False):
+        self.df_full = df_full
+        self.indices = np.asarray(index_array, dtype=np.int64)
+        self.cache_dir = cache_dir
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        gidx = int(self.indices[i])
+        path = os.path.join(self.cache_dir, f'vol_{gidx:06d}.npz')
+        data = np.load(path)
+        z = np.ascontiguousarray(data['Z'])
+        label = int(data['y'])
+        tensor = torch.from_numpy(z).unsqueeze(0).float()
+        if self.augment:
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[1])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[2])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[3])
+        return tensor, label
+
+
+USE_VOL_CACHE = True
+VOL_CACHE_READY = False
+if USE_VOL_CACHE:
+    if FORCE_REBUILD_VOL_CACHE or not vol_cache_matches_df(VOL_CACHE_DIR, len(df_labels)):
+        materialize_vol_cache(df_labels, VOL_CACHE_DIR, force=FORCE_REBUILD_VOL_CACHE)
+    VOL_CACHE_READY = vol_cache_matches_df(VOL_CACHE_DIR, len(df_labels))
+    if VOL_CACHE_READY:
+        print(f"USE_VOL_CACHE=True — usando {VOL_CACHE_DIR}")
+    else:
+        print("AVISO: caché incompleto; Fase 5 usará LUNA16NoduleDataset on-the-fly.")
+else:
+    print("USE_VOL_CACHE=False — lectura on-the-fly desde .mhd en train/val.")
+
+
+
+================================================================================
+=== CELL 7 (code) ===
+================================================================================
+# Fase 4: Modelo — **R3D-18** únicamente (Kinetics / video 3D)
+from torchvision.models.video import r3d_18, R3D_18_Weights
+
+
+class R3D18Expert(nn.Module):
+    """ResNet3D-18 binario: 1 canal CT + cabeza lineal."""
+
+    def __init__(self, num_classes=2):
+        super().__init__()
+        base = r3d_18(weights=R3D_18_Weights.DEFAULT)
+        old_conv = base.stem[0]
+        self.stem_conv = nn.Conv3d(
+            1, 64, kernel_size=(3, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3), bias=False
+        )
+        w = old_conv.weight.data.mean(dim=1, keepdim=True)
+        self.stem_conv.weight.data.copy_(w)
+        base.stem[0] = self.stem_conv
+        self.backbone = nn.Sequential(*list(base.children())[:-1])
+        self.head = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        feat = self.backbone(x).flatten(1)
+        return self.head(feat)
+
+
+model = R3D18Expert(num_classes=2).to(DEVICE)
+dummy = torch.randn(1, 1, 64, 64, 64).to(DEVICE)
+with torch.no_grad():
+    out = model(dummy)
+print(f"R3D18Expert OK — output shape: {out.shape}")
+del dummy, out
+
+n_params = sum(p.numel() for p in model.parameters())
+n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Params: {n_params:,} total | {n_train:,} entrenables")
+torch.cuda.empty_cache()
+
+
+
+================================================================================
+=== CELL 8 (code) ===
+================================================================================
+# Fase 5: StratifiedGroupKFold + AMP + dos fases (R3D-18: cabeza → backbone+cabeza) + CE ponderada
+# Checkpoints: expert4_{RUN_TAG}_fold{k}_best.pth | historial: history_{RUN_TAG}_fold_{k}.json
+
+from sklearn.utils.class_weight import compute_class_weight
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+
+if 'RUN_TAG' not in globals():
+    RUN_TAG = 'twophase_wce_v1'
+
+
+def _labels_to_device(y, device):
+    """Evita torch.tensor(tensor) y copias innecesarias (UserWarning PyTorch)."""
+    if isinstance(y, torch.Tensor):
+        return y.to(device=device, dtype=torch.long).reshape(-1)
+    return torch.as_tensor(np.asarray(y), dtype=torch.long, device=device)
+
+
+def _make_class_weight_tensor(train_labels, device):
+    """Cross-entropy ponderada: pesos 'balanced' según frecuencia por clase en el train del fold."""
+    y = np.asarray(train_labels).reshape(-1)
+    classes = np.array([0, 1])
+    w = compute_class_weight('balanced', classes=classes, y=y)
+    return torch.tensor(w, dtype=torch.float32, device=device)
+
+
+def _unfreeze_all(m):
+    for p in m.parameters():
+        p.requires_grad = True
+
+
+def _freeze_r3d_phase_a(m):
+    for p in m.parameters():
+        p.requires_grad = False
+    for p in m.head.parameters():
+        p.requires_grad = True
+
+
+def _param_groups_r3d(m, lr_bb, lr_head, wd):
+    bb, hd = [], []
+    for name, p in m.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith('head'):
+            hd.append(p)
+        else:
+            bb.append(p)
+    return [
+        {'params': bb, 'lr': lr_bb, 'weight_decay': wd},
+        {'params': hd, 'lr': lr_head, 'weight_decay': wd},
+    ]
+
+
+def _validate_epoch(model, val_loader, criterion, amp_device, amp_enabled):
+    model.eval()
+    val_loss_sum = 0.0
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        val_pbar = tqdm(val_loader, leave=True, mininterval=0.5)
+        for x, y in val_pbar:
+            x = x.to(DEVICE)
+            y = _labels_to_device(y, DEVICE)
+            with torch.amp.autocast(amp_device, enabled=amp_enabled):
+                logits = model(x)
+                loss = criterion(logits, y)
+            val_loss_sum += loss.item() * x.size(0)
+            all_preds.extend(logits.argmax(1).cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+            val_pbar.set_postfix(loss=f"{loss.item():.4f}")
+    val_loss = val_loss_sum / len(val_loader.dataset)
+    val_acc = accuracy_score(all_labels, all_preds)
+    val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    f1_cls = f1_score(all_labels, all_preds, labels=[0, 1], average=None, zero_division=0)
+    return val_loss, val_acc, val_f1, f1_cls
+
+
+# --- Hiperparámetros (ajusta VRAM/tiempo/curvas; N_FOLDS alto reduce varianza del CV) ---
+BATCH_SIZE = 4
+ACCUM_STEPS = 1
+PHASE_A_EPOCHS = 8
+PHASE_B_EPOCHS = 42
+LR_HEAD_PHASE_A = 1e-3
+WD = 1e-2
+LR_BACKBONE_B = 5e-5
+LR_HEAD_B = 1e-4
+WARMUP_FRAC_B = 0.05
+EARLY_STOP_PATIENCE_B = 15
+N_FOLDS = 3
+TARGET_F1_CV = 0.65
+TOTAL_EPOCHS_PER_FOLD = PHASE_A_EPOCHS + PHASE_B_EPOCHS
+AMP_ENABLED = torch.cuda.is_available()
+_AMP_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+scaler = torch.amp.GradScaler(_AMP_DEVICE, enabled=AMP_ENABLED)
+
+sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+labels_arr = df_labels['label'].values
+groups_arr = df_labels['group_id'].values
+
+all_fold_metrics = []
+
+for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(
+        np.zeros(len(df_labels)), labels_arr, groups_arr)):
+
+    print(f"\n{'='*60}")
+    print(f"FOLD {fold_idx+1}/{N_FOLDS}")
+    print(f"{'='*60}")
+
+    train_df = df_labels.iloc[train_idx]
+    val_df = df_labels.iloc[val_idx]
+    print(f"Train: {len(train_df)} (pos={train_df['label'].sum()}) | "
+          f"Val: {len(val_df)} (pos={val_df['label'].sum()})")
+
+    if USE_VOL_CACHE and VOL_CACHE_READY:
+        train_ds = LUNA16CachedVolumeDataset(df_labels, train_idx, VOL_CACHE_DIR, augment=True)
+        val_ds = LUNA16CachedVolumeDataset(df_labels, val_idx, VOL_CACHE_DIR, augment=False)
+    else:
+        train_ds = LUNA16NoduleDataset(train_df, augment=True)
+        val_ds = LUNA16NoduleDataset(val_df, augment=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = R3D18Expert(num_classes=2).to(DEVICE)
+
+    class_w = _make_class_weight_tensor(train_df['label'].values, DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_w)
+
+    best_val_f1 = 0.0
+    best_epoch = -1
+    best_f1_per_class = None
+    history = {
+        'train_loss': [], 'val_loss': [], 'train_acc': [],
+        'val_acc': [], 'val_f1': [], 'val_f1_class0': [], 'val_f1_class1': [],
+        'phase': [], 'epoch_global': [],
+    }
+
+    epoch_global = 0
+
+    # ---------- Fase A: congelar backbone R3D; entrenar solo cabeza ----------
+    _freeze_r3d_phase_a(model)
+    opt_params = list(model.head.parameters())
+
+    optimizer = torch.optim.AdamW(opt_params, lr=LR_HEAD_PHASE_A, weight_decay=WD)
+    scheduler_a = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, PHASE_A_EPOCHS))
+
+    for epoch in range(PHASE_A_EPOCHS):
+        epoch_global += 1
+        model.train()
+        running_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        optimizer.zero_grad(set_to_none=True)
+        step_in_accum = 0
+        pbar = tqdm(train_loader, desc=f"F{fold_idx+1} A {epoch+1}/{PHASE_A_EPOCHS}", leave=True, mininterval=0.5)
+        for x, y in pbar:
+            x = x.to(DEVICE)
+            y = _labels_to_device(y, DEVICE)
+            with torch.amp.autocast(_AMP_DEVICE, enabled=AMP_ENABLED):
+                logits = model(x)
+                loss = criterion(logits, y) / ACCUM_STEPS
+            scaler.scale(loss).backward()
+            step_in_accum += 1
+            running_loss += loss.item() * ACCUM_STEPS * x.size(0)
+            pred = logits.argmax(1)
+            train_correct += (pred == y).sum().item()
+            train_total += y.size(0)
+            pbar.set_postfix(loss=f"{loss.item() * ACCUM_STEPS:.4f}")
+            if step_in_accum % ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        if step_in_accum % ACCUM_STEPS != 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        scheduler_a.step()
+        train_loss = running_loss / len(train_ds)
+        train_acc = train_correct / max(train_total, 1)
+
+        print(
+            f"  → Validación Fase A época {epoch+1}: {len(val_ds)} muestras, {len(val_loader)} batches...",
+            flush=True,
+        )
+        val_loss, val_acc, val_f1, f1_cls = _validate_epoch(
+            model, val_loader, criterion, _AMP_DEVICE, AMP_ENABLED)
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        history['val_f1_class0'].append(float(f1_cls[0]))
+        history['val_f1_class1'].append(float(f1_cls[1]))
+        history['phase'].append('A')
+        history['epoch_global'].append(epoch_global)
+
+        print(
+            f"  Fold {fold_idx+1} | A {epoch+1:3d}/{PHASE_A_EPOCHS} | "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
+            f"val_f1(macro)={val_f1:.4f} | f1_cls=[{f1_cls[0]:.4f},{f1_cls[1]:.4f}]"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_epoch = epoch_global
+            best_f1_per_class = [float(f1_cls[0]), float(f1_cls[1])]
+            ckpt_path = os.path.join(
+                WEIGHTS_DIR, 'checkpoints', f'expert4_{RUN_TAG}_fold{fold_idx}_best.pth')
+            payload = {
+                'state_dict': model.state_dict(),
+                'fold': fold_idx,
+                'epoch': best_epoch,
+                'phase': 'A',
+                'val_f1_macro': float(val_f1),
+                'val_f1_per_class': best_f1_per_class,
+                'val_acc': float(val_acc),
+                'train_loss': float(train_loss),
+                'val_loss': float(val_loss),
+                'model': 'R3D18',
+                'class_weights': class_w.detach().cpu().tolist(),
+            }
+            torch.save(payload, ckpt_path)
+            print(f"    → Mejor checkpoint: {ckpt_path} (val_f1={val_f1:.4f})")
+
+    # ---------- Fase B: backbone + cabeza; LR separados; warmup + cosine ----------
+    _unfreeze_all(model)
+    param_groups = _param_groups_r3d(model, LR_BACKBONE_B, LR_HEAD_B, WD)
+
+    optimizer = torch.optim.AdamW(param_groups)
+    warmup_epochs = max(1, int(PHASE_B_EPOCHS * WARMUP_FRAC_B))
+    cosine_epochs = max(1, PHASE_B_EPOCHS - warmup_epochs)
+    warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+    scheduler_b = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[warmup_epochs])
+
+    epochs_no_improve = 0
+    for epoch in range(PHASE_B_EPOCHS):
+        epoch_global += 1
+        model.train()
+        running_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        optimizer.zero_grad(set_to_none=True)
+        step_in_accum = 0
+        pbar = tqdm(train_loader, desc=f"F{fold_idx+1} B {epoch+1}/{PHASE_B_EPOCHS}", leave=True, mininterval=0.5)
+        for x, y in pbar:
+            x = x.to(DEVICE)
+            y = _labels_to_device(y, DEVICE)
+            with torch.amp.autocast(_AMP_DEVICE, enabled=AMP_ENABLED):
+                logits = model(x)
+                loss = criterion(logits, y) / ACCUM_STEPS
+            scaler.scale(loss).backward()
+            step_in_accum += 1
+            running_loss += loss.item() * ACCUM_STEPS * x.size(0)
+            pred = logits.argmax(1)
+            train_correct += (pred == y).sum().item()
+            train_total += y.size(0)
+            pbar.set_postfix(loss=f"{loss.item() * ACCUM_STEPS:.4f}")
+            if step_in_accum % ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        if step_in_accum % ACCUM_STEPS != 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        scheduler_b.step()
+        train_loss = running_loss / len(train_ds)
+        train_acc = train_correct / max(train_total, 1)
+
+        print(
+            f"  → Validación Fase B época {epoch+1}: {len(val_ds)} muestras...",
+            flush=True,
+        )
+        val_loss, val_acc, val_f1, f1_cls = _validate_epoch(
+            model, val_loader, criterion, _AMP_DEVICE, AMP_ENABLED)
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        history['val_f1_class0'].append(float(f1_cls[0]))
+        history['val_f1_class1'].append(float(f1_cls[1]))
+        history['phase'].append('B')
+        history['epoch_global'].append(epoch_global)
+
+        print(
+            f"  Fold {fold_idx+1} | B {epoch+1:3d}/{PHASE_B_EPOCHS} | "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
+            f"val_f1(macro)={val_f1:.4f} | f1_cls=[{f1_cls[0]:.4f},{f1_cls[1]:.4f}]"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_epoch = epoch_global
+            best_f1_per_class = [float(f1_cls[0]), float(f1_cls[1])]
+            ckpt_path = os.path.join(
+                WEIGHTS_DIR, 'checkpoints', f'expert4_{RUN_TAG}_fold{fold_idx}_best.pth')
+            payload = {
+                'state_dict': model.state_dict(),
+                'fold': fold_idx,
+                'epoch': best_epoch,
+                'phase': 'B',
+                'val_f1_macro': float(val_f1),
+                'val_f1_per_class': best_f1_per_class,
+                'val_acc': float(val_acc),
+                'train_loss': float(train_loss),
+                'val_loss': float(val_loss),
+                'model': 'R3D18',
+                'class_weights': class_w.detach().cpu().tolist(),
+            }
+            torch.save(payload, ckpt_path)
+            print(f"    → Mejor checkpoint: {ckpt_path} (val_f1={val_f1:.4f})")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if EARLY_STOP_PATIENCE_B is not None and epochs_no_improve >= EARLY_STOP_PATIENCE_B:
+                print(f"    Early stopping Fase B (sin mejora {EARLY_STOP_PATIENCE_B} épocas).")
+                break
+
+    fold_metrics = {
+        'fold': fold_idx,
+        'best_val_f1': best_val_f1,
+        'best_epoch': best_epoch,
+        'best_f1_per_class': best_f1_per_class,
+        'final_val_acc': history['val_acc'][-1],
+        'final_val_f1': history['val_f1'][-1],
+    }
+    all_fold_metrics.append(fold_metrics)
+    print(f"Fold {fold_idx+1} finalizado — mejor val_f1={best_val_f1:.4f} (época global {best_epoch})")
+
+    hist_path = os.path.join(WEIGHTS_DIR, 'metrics', f'history_{RUN_TAG}_fold_{fold_idx}.json')
+    with open(hist_path, 'w') as f:
+        json.dump(history, f, indent=2)
+
+print(f"\n{'='*60}")
+print("RESUMEN CROSS-VALIDATION")
+print(f"{'='*60}")
+f1s = [m['best_val_f1'] for m in all_fold_metrics]
+print(f"F1 macro por fold: {[f'{v:.4f}' for v in f1s]}")
+print(f"Media ± std: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
+print(
+    f"Objetivo referencia (criterio sobre media CV, no un solo fold afortunado): "
+    f"F1 macro > {TARGET_F1_CV} → "
+    f"{'cumplido (media)' if np.mean(f1s) > TARGET_F1_CV else 'pendiente (revisa folds/LR/épocas)'}."
+)
+summary_path = os.path.join(WEIGHTS_DIR, 'metrics', f'cv_summary_{RUN_TAG}.json')
+with open(summary_path, 'w') as f:
+    json.dump(all_fold_metrics, f, indent=2)
+print(f"Resumen guardado en {summary_path}")
+
+
+
+================================================================================
+=== CELL 9 (code) ===
+================================================================================
+# Fase 6: Evaluación detallada del mejor fold
+if 'RUN_TAG' not in globals():
+    RUN_TAG = 'twophase_wce_v1'
+
+best_fold = max(all_fold_metrics, key=lambda m: m['best_val_f1'])
+best_fold_idx = best_fold['fold']
+print(f"Mejor fold: {best_fold_idx} (F1={best_fold['best_val_f1']:.4f})")
+
+# Cargar modelo del mejor fold (checkpoint puede ser dict con 'state_dict' o tensor plano legacy)
+ckpt = os.path.join(WEIGHTS_DIR, 'checkpoints', f'expert4_{RUN_TAG}_fold{best_fold_idx}_best.pth')
+if not os.path.isfile(ckpt):
+    _alt = os.path.join(WEIGHTS_DIR, 'checkpoints', f'expert4_fold{best_fold_idx}_best.pth')
+    ckpt = _alt if os.path.isfile(_alt) else ckpt
+if not os.path.isfile(ckpt):
+    raise FileNotFoundError(
+        f"No existe el checkpoint (ni expert4_{RUN_TAG}_fold{best_fold_idx}_best ni legacy). "
+        f"Entrena la Fase 5 o revisa WEIGHTS_DIR / RUN_TAG."
+    )
+try:
+    _blob = torch.load(ckpt, map_location=DEVICE, weights_only=False)
+except TypeError:
+    _blob = torch.load(ckpt, map_location=DEVICE)
+eval_model = R3D18Expert(num_classes=2).to(DEVICE)
+_state = _blob['state_dict'] if isinstance(_blob, dict) and 'state_dict' in _blob else _blob
+eval_model.load_state_dict(_state)
+eval_model.eval()
+
+# Reconstruir val del mejor fold
+_, val_idx_best = list(sgkf.split(np.zeros(len(df_labels)), labels_arr, groups_arr))[best_fold_idx]
+val_df_best = df_labels.iloc[val_idx_best]
+if USE_VOL_CACHE and VOL_CACHE_READY:
+    val_ds_best = LUNA16CachedVolumeDataset(df_labels, val_idx_best, VOL_CACHE_DIR, augment=False)
+else:
+    val_ds_best = LUNA16NoduleDataset(val_df_best, augment=False)
+val_loader_best = DataLoader(val_ds_best, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+all_preds, all_labels, all_probs = [], [], []
+with torch.no_grad():
+    for x, y in tqdm(val_loader_best, desc="Evaluación"):
+        x = x.to(DEVICE)
+        logits = eval_model(x)
+        probs = F.softmax(logits, dim=1)
+        all_preds.extend(logits.argmax(1).cpu().numpy())
+        if isinstance(y, torch.Tensor):
+            y_np = y.detach().cpu().numpy()
+        else:
+            y_np = np.asarray(y)
+        all_labels.extend(y_np.reshape(-1).tolist())
+        all_probs.extend(probs[:, 1].cpu().numpy())
+
+all_labels = np.array(all_labels)
+all_preds = np.array(all_preds)
+
+print("\n" + classification_report(all_labels, all_preds, target_names=["Benigno", "Maligno"]))
+
+cm = confusion_matrix(all_labels, all_preds)
+print("Confusion Matrix:")
+print(cm)
+
+# AUC si hay ambas clases
+if len(np.unique(all_labels)) == 2:
+    auc = roc_auc_score(all_labels, all_probs)
+    print(f"AUC-ROC: {auc:.4f}")
+
+# Guardar
+eval_metrics = {
+    'accuracy': float(accuracy_score(all_labels, all_preds)),
+    'precision_macro': float(precision_score(all_labels, all_preds, average='macro', zero_division=0)),
+    'recall_macro': float(recall_score(all_labels, all_preds, average='macro', zero_division=0)),
+    'f1_macro': float(f1_score(all_labels, all_preds, average='macro', zero_division=0)),
+    'confusion_matrix': cm.tolist(),
+}
+with open(os.path.join(WEIGHTS_DIR, 'metrics', 'eval_best_fold.json'), 'w') as f:
+    json.dump(eval_metrics, f, indent=2)
+
+
+
+================================================================================
+=== CELL 14 (code) ===
+================================================================================
+# Fase 9: Resumen final y persistencia
+if 'RUN_TAG' not in globals():
+    RUN_TAG = 'twophase_wce_v1'
+print("="*60)
+print("EXPERTO 4 — LUNA16 SWIN3D — RESUMEN")
+print("="*60)
+print(f"RUN_TAG (prefijo checkpoints): {RUN_TAG}")
+
+print("\nModelo: R3D-18 (R3D18Expert)")
+print(f"Parámetros: {n_params:,}")
+print(f"Folds: {N_FOLDS} (5–10 reduce varianza; criterio F1 sobre media±std en CV)")
+print(f"Épocas/fold (máx.): Fase A {PHASE_A_EPOCHS} + Fase B {PHASE_B_EPOCHS} = {TOTAL_EPOCHS_PER_FOLD} (early stop en B)")
+print(f"Batch size: {BATCH_SIZE}, accum: {ACCUM_STEPS}")
+print(f"LR: Fase A cabeza={LR_HEAD_PHASE_A}; Fase B backbone/head={LR_BACKBONE_B}/{LR_HEAD_B} | WD: {WD}")
+print(f"AMP: {AMP_ENABLED}")
+print(f"Device: {DEVICE}")
+
+print(f"\nMétricas CV:")
+for m in all_fold_metrics:
+    print(f"  Fold {m['fold']}: F1={m['best_val_f1']:.4f}")
+
+f1s = [m['best_val_f1'] for m in all_fold_metrics]
+print(f"  Media: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
+
+print(f"\nArtefactos en Drive:")
+print(f"  {WEIGHTS_DIR}")
+for root, dirs, files in os.walk(WEIGHTS_DIR):
+    for f_name in files:
+        fp = os.path.join(root, f_name)
+        sz = os.path.getsize(fp) / 1024
+        print(f"    {os.path.relpath(fp, WEIGHTS_DIR):50s} {sz:.1f} KB")
+
+print("\nExperto 4 listo para integración MoE.")
+print("Tensor de entrada esperado: [B, 1, 64, 64, 64]")
+print("Salida: logits [B, 2] (benigno/maligno)")
+
+

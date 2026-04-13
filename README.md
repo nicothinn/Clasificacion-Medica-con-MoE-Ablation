@@ -23,7 +23,7 @@ El archivo [`notebooks/03_Pipeline_Router_MoE.ipynb`](notebooks/03_Pipeline_Rout
 | **DataLoader balanceado** | `WeightedRandomSampler` + `sample_cap` para no dominar NIH sobre volúmenes minoritarios. |
 | **Ablation study** | Sobre embeddings guardados: **A** cabeza lineal sobre `Z`; **B** GMM; **C** Naive Bayes; **D** k-NN (FAISS); tabla comparativa. |
 | **Evaluación KPI** | Routing accuracy, balance `max(f_i)/min(f_i) < 1.30`, pico de VRAM, OOD vía entropía del gating (si aplica). |
-| **Expert on-demand** | `ExpertOnDemandManager`: expertos en CPU, carga LRU en GPU solo del experto activo (ahorro de VRAM en 2×12 GB). |
+| **MoE inferencia (expertos)** | `ExpertsPinnedGPU`: los 5 expertos se cargan una vez en VRAM (rápido); OOM manejado con mensaje claro; `device='cpu'` como escape. Alias `ExpertOnDemandManager` por compatibilidad. |
 
 ---
 

@@ -1,0 +1,187 @@
+
+--- CELL 15 ---
+import os
+import numpy as np
+import torch
+from sklearn.model_selection import train_test_split
+
+def prepare_unified_embeddings_to_drive(
+    roots,
+    preprocessor,
+    device,
+    save_path,
+    sample_cap_per_dataset=None,
+    seed=42
+):
+    """
+    Extrae los CLS tokens de los datos y los guarda en Drive con if-exists.
+    Contiene Z_train, Z_val, y_train, y_val listos para cualquier router.
+    """
+    if os.path.exists(save_path):
+        print(f"✅ ¡El archivo ya existe! Saltando extracción.")
+        print(f"Ruta: {save_path}")
+        data = np.load(save_path)
+        print(f"Contenido: Z_train {data['Z_train'].shape}, Z_val {data['Z_val'].shape}")
+        return data['Z_train'], data['Z_val'], data['y_train'], data['y_val']
+
+    print(f"⏳ El archivo no existe en {save_path}. Iniciando extracción masiva...")
+    set_seed(seed)
+
+    loader, _ = build_router_dataloader_weighted(
+        roots=roots,
+        preprocessor=preprocessor,
+        batch_size=16,
+        sample_cap=sample_cap_per_dataset,
+        include_task_label=False
+    )
+
+    model_ext = VisionRouter(embed_dim=192, num_experts=5, num_layers=12, pretrained=True).to(device).eval()
+
+    Z_list, y_list = [], []
+
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            tensors, expert_ids = batch
+            tensors = [t.to(device) for t in tensors]
+
+            _, cls = model_ext(tensors)
+
+            Z_list.append(cls.cpu().numpy())
+            y_list.append(expert_ids.numpy())
+
+            if (i + 1) % 50 == 0:
+                print(f" Procesados {(i + 1) * 16} ejemplos...")
+
+    Z_all = np.concatenate(Z_list, axis=0)
+    y_all = np.concatenate(y_list, axis=0)
+
+    Z_train, Z_val, y_train, y_val = train_test_split(
+        Z_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
+    )
+
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+
+    np.savez_compressed(save_path, Z_train=Z_train, Z_val=Z_val, y_train=y_train, y_val=y_val)
+    print(f"✅ ¡Éxito! Dataset unificado guardado en: {save_path}")
+    print(f"Total Train: {Z_train.shape} | Total Val: {Z_val.shape}")
+
+    return Z_train, Z_val, y_train, y_val
+
+
+--- CELL 17 ---
+# --- Fase 3: feedback de expertos (sin warm-up / sin partial-unfreeze previos) ---
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"DEVICE={DEVICE}")
+
+BATCH_SIZE = 4
+SAMPLE_CAP = 1000
+NUM_WORKERS = 2
+PROF_EPOCHS = 6
+PROF_MAX_BATCHES = None
+ALPHA_AUX = 0.03
+
+ROUTER_INIT_CKPT = None
+# ROUTER_INIT_CKPT = os.path.join(FEATURE_DIR, "router_head_phase2_best.pth")
+
+
+UNIFIED_FILE = os.path.join(FEATURE_DIR, "unified_cls_tokens.npz")
+Z_train_np, Z_val_np, y_train_np, y_val_np = prepare_unified_embeddings_to_drive(
+    roots=DATASET_ROOTS,
+    preprocessor=preprocessor,
+    device=DEVICE,
+    save_path=UNIFIED_FILE,
+    sample_cap_per_dataset=min(SAMPLE_CAP, 1000)
+)
+
+experts_dict, expert_info = load_all_experts_from_drive(
+    WEIGHTS_DIR, device="cpu", strict=False, pretrained_backbone=False
+)
+print_expert_load_report(expert_info)
+
+experts_mgr = ExpertsPinnedGPU(experts_dict, device=str(DEVICE))
+
+set_seed(42)
+loader_prof, _ = build_router_dataloader_weighted(
+    roots=DATASET_ROOTS,
+    preprocessor=preprocessor,
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
+    sample_cap=SAMPLE_CAP,
+    include_task_label=True,
+)
+
+router = VisionRouter(embed_dim=192, num_experts=5, num_layers=12, pretrained=True)
+if ROUTER_INIT_CKPT and os.path.isfile(ROUTER_INIT_CKPT):
+    sd = torch.load(ROUTER_INIT_CKPT, map_location=DEVICE)
+    if "model_state_dict" in sd:
+        router.load_state_dict(sd["model_state_dict"], strict=False)
+        print(f"Router cargado: {ROUTER_INIT_CKPT}")
+    elif "router_head" in sd:
+        router.router_head.load_state_dict(sd["router_head"], strict=True)
+        print(f"Router: solo cabeza desde {ROUTER_INIT_CKPT}")
+
+router, history_prof = fit_router_with_eval(
+    model=router,
+    dataloader=loader_prof,
+    Z_val_np=Z_val_np,
+    y_val_np=y_val_np,
+    device=DEVICE,
+    mode="head_only",
+    epochs=PROF_EPOCHS,
+    alpha_aux=ALPHA_AUX,
+    lr_router=1e-3,
+    lr_vit=3e-5,
+    label_smoothing=0.1,
+    unfreeze_last_blocks=0,
+    max_batches_per_epoch=PROF_MAX_BATCHES,
+    ckpt_path=os.path.join(FEATURE_DIR, "router_professor_fase3_only.pth"),
+    experts=experts_mgr.experts,
+)
+
+print("Listo. Checkpoint:", os.path.join(FEATURE_DIR, "router_professor_fase3_only.pth"))
+
+
+--- CELL 18 ---
+def verify_training_devices(router, experts_mgr, device):
+    """Imprime dispositivo de router/expertos y VRAM actual (si hay CUDA)."""
+    import torch
+    rdev = next(router.parameters()).device
+    print("=== Verificación dispositivos ===")
+    print(f"Objetivo: {device}")
+    print(f"Router (primer parámetro): {rdev}")
+    for eid in sorted(experts_mgr.experts.keys()):
+        edev = next(experts_mgr.experts[eid].parameters()).device
+        print(f"  Experto {eid}: {edev}")
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved = torch.cuda.memory_reserved() / 1024 ** 3
+        print(f"VRAM actual — allocated: {alloc:.2f} GiB | reserved: {reserved:.2f} GiB")
+    else:
+        print("(Sin CUDA o device CPU: no hay VRAM de GPU.)")
+
+
+verify_training_devices(router, experts_mgr, DEVICE)
+
+
+--- CELL 19 ---
+router, history_prof = fit_router_with_eval(
+    model=router,
+    dataloader=loader_prof,
+    Z_val_np=Z_val_np,
+    y_val_np=y_val_np,
+    device=DEVICE,
+    mode="head_only",
+    epochs=PROF_EPOCHS,
+    alpha_aux=ALPHA_AUX,
+    lr_router=1e-3,
+    lr_vit=3e-5,
+    label_smoothing=0.1,
+    unfreeze_last_blocks=0,
+    max_batches_per_epoch=PROF_MAX_BATCHES,
+    ckpt_path=os.path.join(FEATURE_DIR, "router_professor_fase3_only.pth"),
+    experts=experts_mgr.experts,
+)
+
+print("Listo. Checkpoint:", os.path.join(FEATURE_DIR, "router_professor_fase3_only.pth"))
+

@@ -1,0 +1,861 @@
+
+--- CELL 1 ---
+# Fase 0: Setup & montar Drive
+!pip install -q SimpleITK nibabel monai timm scikit-learn tqdm seaborn scipy matplotlib-inline
+
+from google.colab import drive
+import os, glob, time, json, shutil, subprocess, random
+import numpy as np
+import pandas as pd
+import SimpleITK as sitk
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+# AMP: usar torch.amp en Fase 5 (torch.cuda.amp está deprecado en PyTorch 2.x)
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, roc_auc_score, confusion_matrix,
+                             classification_report)
+from tqdm.auto import tqdm
+# Gráficas dentro del notebook: el backend debe fijarse ANTES de importar pyplot
+import matplotlib as mpl
+try:
+    mpl.use("module://matplotlib_inline.backend_inline")
+except Exception:
+    try:
+        __import__("IPython").get_ipython().run_line_magic("matplotlib", "inline")
+    except Exception:
+        pass
+import matplotlib.pyplot as plt
+import timm
+print("Matplotlib: salida embebida en el notebook (inline). Reinicia el kernel si no ves gráficas.")
+
+drive.mount('/content/drive')
+
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device: {DEVICE}")
+
+# Misma convención que 01_Exploracion_Estructura_Datasets.ipynb
+RAW_DIR = '/content/drive/MyDrive/PROYECTO_MOE_VISION/01_Data/Raw/'
+LOCAL_DEST = '/content/datasets/'
+LUNA_ZIP_NAME = 'Luna16 Lung Cancer Dataset.zip'
+LUNA_FOLDER_NAME = os.path.splitext(LUNA_ZIP_NAME)[0]  # "Luna16 Lung Cancer Dataset"
+LUNA_BASE = os.path.join(LOCAL_DEST, LUNA_FOLDER_NAME)
+
+WEIGHTS_BASE = '/content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/Experts_2D/'
+WEIGHTS_DIR = os.path.join(WEIGHTS_BASE, 'Expert4_LUNA16')
+# Prefijo de archivos de checkpoint/historial (cámbialo por experimento para no pisar runs previos)
+RUN_TAG = 'twophase_wce_v1'
+for d in ['checkpoints', 'metrics', 'figures']:
+    os.makedirs(os.path.join(WEIGHTS_DIR, d), exist_ok=True)
+os.makedirs(LOCAL_DEST, exist_ok=True)
+print("Rutas configuradas.")
+print(f"  Zip en Drive: {os.path.join(RAW_DIR, LUNA_ZIP_NAME)}")
+print(f"  Datos locales (CSV + .mhd vienen dentro del zip): {LUNA_BASE}")
+print(f"  Pesos y métricas (Experto 4): {WEIGHTS_DIR}")
+
+
+--- CELL 2 ---
+# Fase 1: LUNA16 — mismo flujo que 01_Exploracion_Estructura_Datasets.ipynb
+# 1) Copiar el zip desde Drive a /content/datasets/
+# 2) Descomprimir en /content/datasets/Luna16 Lung Cancer Dataset/
+# 3) Borrar el zip local (libera espacio en Colab)
+# Los CSV (annotations, candidates_V2, etc.) ya vienen dentro del zip; no se crean a mano.
+
+FORCE_REUNZIP = False  # True para forzar descompresión aunque existan .mhd
+
+drive_zip_path = os.path.join(RAW_DIR, LUNA_ZIP_NAME)
+if not os.path.isfile(drive_zip_path):
+    alt = sorted(
+        glob.glob(os.path.join(RAW_DIR, '*Luna*.zip')) +
+        glob.glob(os.path.join(RAW_DIR, '*luna*.zip'))
+    )
+    if alt:
+        drive_zip_path = alt[0]
+        print(f"AVISO: usando zip encontrado: {drive_zip_path}")
+    else:
+        raise FileNotFoundError(
+            f"No está {LUNA_ZIP_NAME} en {RAW_DIR}. Sube el zip o ajusta LUNA_ZIP_NAME."
+        )
+
+local_zip_path = os.path.join(LOCAL_DEST, os.path.basename(drive_zip_path))
+unzip_dir = os.path.join(LOCAL_DEST, os.path.splitext(os.path.basename(drive_zip_path))[0])
+
+mhd_probe = glob.glob(os.path.join(unzip_dir, '**', '*.mhd'), recursive=True)
+if FORCE_REUNZIP or len(mhd_probe) < 100:
+    print("1. Copiando zip desde Drive al entorno local...")
+    t0 = time.time()
+    shutil.copy2(drive_zip_path, local_zip_path)
+    print(f"   Copia OK ({time.time()-t0:.1f}s)")
+
+    os.makedirs(unzip_dir, exist_ok=True)
+    print(f"2. Descomprimiendo en {unzip_dir} ...")
+    t1 = time.time()
+    r = subprocess.run(
+        ['unzip', '-q', '-o', local_zip_path, '-d', unzip_dir],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print("unzip falló, intentando zipfile...")
+        import zipfile
+        with zipfile.ZipFile(local_zip_path, 'r') as zf:
+            zf.extractall(unzip_dir)
+    print(f"   Unzip OK ({time.time()-t1:.1f}s)")
+
+    print("3. Borrando zip local...")
+    os.remove(local_zip_path)
+else:
+    print(f"Datos ya presentes en {unzip_dir} ({len(mhd_probe)} .mhd). "
+          f"Pon FORCE_REUNZIP=True para volver a extraer.")
+
+LUNA_BASE = unzip_dir  # raíz del dataset descomprimido (incluye CSV del challenge)
+
+mhd_files = sorted(glob.glob(os.path.join(LUNA_BASE, '**', '*.mhd'), recursive=True))
+raw_files = sorted(
+    glob.glob(os.path.join(LUNA_BASE, '**', '*.raw'), recursive=True)
+    + glob.glob(os.path.join(LUNA_BASE, '**', '*.zraw'), recursive=True)
+)
+csv_files = sorted(glob.glob(os.path.join(LUNA_BASE, '**', '*.csv'), recursive=True))
+
+print(f"\nArchivos encontrados bajo {LUNA_BASE}:")
+print(f"  .mhd: {len(mhd_files)}")
+print(f"  .raw/.zraw: {len(raw_files)}")
+print(f"  .csv: {len(csv_files)}")
+for c in csv_files:
+    print(f"    {c}")
+
+
+--- CELL 3 ---
+# --- Descubrimiento: ¿dónde está la etiqueta del dataset? (CSV vs .mhd) ---
+# Ejecutar después de la Fase 1 (tener LUNA_BASE, mhd_files, csv_files definidos).
+
+print("=" * 70)
+print("ETIQUETAS LUNA16: ¿en el CSV o en el volumen .mhd?")
+print("=" * 70)
+
+print("""
+Resumen esperado (challenge LUNA16):
+- Los archivos .mhd (+ .raw/.zraw) son SOLO imágenes CT (valores HU, geometría).
+  No incluyen la etiqueta de clase del track de candidatos ni malignidad clínica.
+- Las columnas de coordenadas y la columna `class` (0/1) vienen en los CSV del zip,
+  en particular candidates / candidates_V2 para el track de falsos positivos.
+- annotations.csv da posición y tamaño del nódulo de referencia (detección), no
+  benigno/maligno al estilo LIDC.
+""")
+
+print("\n[1] CSV encontrados en el dataset descomprimido:\n")
+for cpath in csv_files:
+    bn = os.path.basename(cpath)
+    try:
+        df = pd.read_csv(cpath, nrows=5)
+        cols = list(df.columns)
+        print(f"  • {bn}")
+        print(f"    columnas ({len(cols)}): {cols}")
+        if "class" in [x.lower() for x in cols]:
+            print("    → contiene columna 'class' (etiqueta 0/1 por candidato).")
+        if "malign" in " ".join(cols).lower():
+            print("    → contiene algo relacionado con malignidad (revisar).")
+    except Exception as e:
+        print(f"  • {bn}  ERROR leyendo: {e}")
+
+print("\n[2] Un archivo .mhd de ejemplo (metadatos SimpleITK):\n")
+if mhd_files:
+    sample_mhd = mhd_files[0]
+    print(f"  Archivo: {sample_mhd}")
+    img = sitk.ReadImage(sample_mhd)
+    keys = list(img.GetMetaDataKeys())
+    print(f"  Número de claves de metadatos: {len(keys)}")
+    for k in keys[:25]:
+        try:
+            v = img.GetMetaData(k)
+            if len(v) > 80:
+                v = v[:77] + "..."
+            print(f"    {k}: {v}")
+        except Exception:
+            print(f"    {k}: <no legible>")
+    if len(keys) > 25:
+        print(f"    ... y {len(keys)-25} claves más.")
+    print("""
+  Interpretación: suele haber DICOM/Series UID, espaciado, etc. No esperes una
+  columna 'label' o 'cancer' aquí salvo que tu pipeline haya escrito algo
+  personalizado (p. ej. otro notebook que añadió RouterLabel al convertir a .mha).
+""")
+else:
+    print("  (No hay .mhd todavía — ejecuta la celda de descompresión primero.)")
+
+print("\n[3] Conclusión para este notebook:\n")
+print("  → La etiqueta que usa el DataLoader (columna `label`) se arma leyendo")
+print("    el CSV de candidatos con `class`, NO leyendo el .mhd.")
+print("  → Si necesitas benigno/maligno como en papers con LIDC, hay que unir")
+print("    con tablas de malignancy externas o un CSV procesado aparte.\n")
+print("=" * 70)
+
+
+--- CELL 5 ---
+# Fase 3: Dataset — carga volumen, resample, HU clip, min-max, ROI 64³
+ROI_SIZE = (64, 64, 64)
+HU_MIN, HU_MAX = -1000.0, 400.0
+
+
+def extract_roi_volume_np(row):
+    """Un ROI 64³ normalizado [0,1] desde una fila de df_labels. Shape (64,64,64) float32."""
+    mhd_path = row['mhd_path']
+    try:
+        img = sitk.ReadImage(mhd_path)
+        orig_spacing = np.array(img.GetSpacing())
+        orig_size = np.array(img.GetSize())
+        new_spacing = np.array([1.0, 1.0, 1.0])
+        new_size = (orig_size * orig_spacing / new_spacing).astype(int).tolist()
+
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetOutputSpacing(new_spacing.tolist())
+        resampler.SetSize(new_size)
+        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetOutputOrigin(img.GetOrigin())
+        resampler.SetOutputDirection(img.GetDirection())
+        img = resampler.Execute(img)
+
+        vol = sitk.GetArrayFromImage(img).astype(np.float32)
+
+        vol = np.clip(vol, HU_MIN, HU_MAX)
+        vol = (vol - HU_MIN) / (HU_MAX - HU_MIN)
+
+        world_coord = np.array([row['coordX'], row['coordY'], row['coordZ']])
+        voxel_coord = img.TransformPhysicalPointToIndex(world_coord.tolist())
+        cz, cy, cx = voxel_coord[2], voxel_coord[1], voxel_coord[0]
+
+        half = 32
+        d, h, w = vol.shape
+        z0 = max(0, cz - half); z1 = z0 + 64
+        y0 = max(0, cy - half); y1 = y0 + 64
+        x0 = max(0, cx - half); x1 = x0 + 64
+
+        if z1 > d: z0 = max(0, d - 64); z1 = d
+        if y1 > h: y0 = max(0, h - 64); y1 = h
+        if x1 > w: x0 = max(0, w - 64); x1 = w
+
+        roi = vol[z0:z1, y0:y1, x0:x1]
+
+        pad_d = 64 - roi.shape[0]
+        pad_h = 64 - roi.shape[1]
+        pad_w = 64 - roi.shape[2]
+        if pad_d > 0 or pad_h > 0 or pad_w > 0:
+            roi = np.pad(roi, ((0, pad_d), (0, pad_h), (0, pad_w)), mode='constant')
+
+        return roi.astype(np.float32)
+    except Exception as e:
+        print(f"Error cargando {mhd_path}: {e}")
+        return np.zeros((64, 64, 64), dtype=np.float32)
+
+
+class LUNA16NoduleDataset(Dataset):
+    def __init__(self, df, augment=False):
+        self.records = df.reset_index(drop=True)
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        row = self.records.iloc[idx]
+        label = int(row['label'])
+        roi = extract_roi_volume_np(row)
+        tensor = torch.from_numpy(np.ascontiguousarray(roi)).unsqueeze(0)
+
+        if self.augment:
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[1])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[2])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[3])
+
+        return tensor, label
+
+# Test rápido
+_test_ds = LUNA16NoduleDataset(df_labels.head(2))
+_t, _l = _test_ds[0]
+print(f"Test shape: {_t.shape}, label: {_l}, min={_t.min():.3f}, max={_t.max():.3f}")
+
+
+--- CELL 6 ---
+# Fase 3B: Materializar ROIs 64³ en disco + dataset que solo lee .npz (acelera train/val)
+
+ROI_CACHE_DIR = os.path.join(LOCAL_DEST, 'Luna16_ROI_cache_v1')
+FORCE_REBUILD_ROI_CACHE = False  # True para regenerar todo el caché
+
+
+def materialize_roi_cache(df_labels, cache_dir, force=False):
+    """Escribe roi_{idx:06d}.npz con Z (64,64,64) y y (escalar), idx = posición en df_labels."""
+    os.makedirs(cache_dir, exist_ok=True)
+    n = len(df_labels)
+    for idx in tqdm(range(n), desc='Materializando ROI cache'):
+        out_path = os.path.join(cache_dir, f'roi_{idx:06d}.npz')
+        if os.path.isfile(out_path) and not force:
+            continue
+        row = df_labels.iloc[idx]
+        vol = extract_roi_volume_np(row)
+        np.savez_compressed(
+            out_path,
+            Z=vol.astype(np.float32),
+            y=np.int64(int(row['label'])),
+        )
+    meta = {'version': 'v1', 'n_rows': n, 'roi_shape': list(ROI_SIZE)}
+    with open(os.path.join(cache_dir, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f"Caché listo: {cache_dir} ({n} ROIs)")
+
+
+def roi_cache_matches_df(cache_dir, n_expected):
+    p = os.path.join(cache_dir, 'meta.json')
+    if not os.path.isfile(p):
+        return False
+    with open(p) as f:
+        m = json.load(f)
+    return int(m.get('n_rows', -1)) == int(n_expected)
+
+
+class LUNA16CachedROIDataset(Dataset):
+    """Subconjunto por índices globales en df_labels; archivos roi_{global_idx}.npz."""
+
+    def __init__(self, df_full, index_array, cache_dir, augment=False):
+        self.df_full = df_full
+        self.indices = np.asarray(index_array, dtype=np.int64)
+        self.cache_dir = cache_dir
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        gidx = int(self.indices[i])
+        path = os.path.join(self.cache_dir, f'roi_{gidx:06d}.npz')
+        data = np.load(path)
+        z = np.ascontiguousarray(data['Z'])
+        label = int(data['y'])
+        tensor = torch.from_numpy(z).unsqueeze(0).float()
+        if self.augment:
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[1])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[2])
+            if random.random() > 0.5:
+                tensor = torch.flip(tensor, dims=[3])
+        return tensor, label
+
+
+USE_ROI_CACHE = True
+ROI_CACHE_READY = False
+if USE_ROI_CACHE:
+    if FORCE_REBUILD_ROI_CACHE or not roi_cache_matches_df(ROI_CACHE_DIR, len(df_labels)):
+        materialize_roi_cache(df_labels, ROI_CACHE_DIR, force=FORCE_REBUILD_ROI_CACHE)
+    ROI_CACHE_READY = roi_cache_matches_df(ROI_CACHE_DIR, len(df_labels))
+    if ROI_CACHE_READY:
+        print(f"USE_ROI_CACHE=True — usando {ROI_CACHE_DIR}")
+    else:
+        print("AVISO: caché incompleto; Fase 5 usará LUNA16NoduleDataset on-the-fly.")
+else:
+    print("USE_ROI_CACHE=False — lectura on-the-fly desde .mhd en train/val.")
+
+
+--- CELL 8 ---
+# Fase 5: StratifiedGroupKFold + AMP + dos fases (cabeza vs backbone) + CE ponderada
+# Checkpoints: expert4_{RUN_TAG}_fold{k}_best.pth | historial: history_{RUN_TAG}_fold_{k}.json
+
+from sklearn.utils.class_weight import compute_class_weight
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+
+if 'RUN_TAG' not in globals():
+    RUN_TAG = 'twophase_wce_v1'
+
+
+def _labels_to_device(y, device):
+    """Evita torch.tensor(tensor) y copias innecesarias (UserWarning PyTorch)."""
+    if isinstance(y, torch.Tensor):
+        return y.to(device=device, dtype=torch.long).reshape(-1)
+    return torch.as_tensor(np.asarray(y), dtype=torch.long, device=device)
+
+
+def _make_class_weight_tensor(train_labels, device):
+    """Cross-entropy ponderada: pesos 'balanced' según frecuencia por clase en el train del fold."""
+    y = np.asarray(train_labels).reshape(-1)
+    classes = np.array([0, 1])
+    w = compute_class_weight('balanced', classes=classes, y=y)
+    return torch.tensor(w, dtype=torch.float32, device=device)
+
+
+def _freeze_dcswin_phase_a(m, train_swin_norm=True):
+    for p in m.parameters():
+        p.requires_grad = False
+    for p in m.head.parameters():
+        p.requires_grad = True
+    if train_swin_norm and getattr(m, 'norm', None) is not None:
+        for p in m.norm.parameters():
+            p.requires_grad = True
+
+
+def _unfreeze_all(m):
+    for p in m.parameters():
+        p.requires_grad = True
+
+
+def _freeze_r3d_phase_a(m):
+    for p in m.parameters():
+        p.requires_grad = False
+    for p in m.head.parameters():
+        p.requires_grad = True
+
+
+def _param_groups_dcswin(m, lr_swin, lr_cnn, lr_head, wd):
+    swin_p, cnn_p, head_p = [], [], []
+    for name, p in m.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith('head'):
+            head_p.append(p)
+        elif 'cnn_branch' in name:
+            cnn_p.append(p)
+        else:
+            swin_p.append(p)
+    return [
+        {'params': swin_p, 'lr': lr_swin, 'weight_decay': wd},
+        {'params': cnn_p, 'lr': lr_cnn, 'weight_decay': wd},
+        {'params': head_p, 'lr': lr_head, 'weight_decay': wd},
+    ]
+
+
+def _param_groups_r3d(m, lr_bb, lr_head, wd):
+    bb, hd = [], []
+    for name, p in m.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith('head'):
+            hd.append(p)
+        else:
+            bb.append(p)
+    return [
+        {'params': bb, 'lr': lr_bb, 'weight_decay': wd},
+        {'params': hd, 'lr': lr_head, 'weight_decay': wd},
+    ]
+
+
+def _validate_epoch(model, val_loader, criterion, amp_device, amp_enabled):
+    model.eval()
+    val_loss_sum = 0.0
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        val_pbar = tqdm(val_loader, leave=True, mininterval=0.5)
+        for x, y in val_pbar:
+            x = x.to(DEVICE)
+            y = _labels_to_device(y, DEVICE)
+            with torch.amp.autocast(amp_device, enabled=amp_enabled):
+                logits = model(x)
+                loss = criterion(logits, y)
+            val_loss_sum += loss.item() * x.size(0)
+            all_preds.extend(logits.argmax(1).cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+            val_pbar.set_postfix(loss=f"{loss.item():.4f}")
+    val_loss = val_loss_sum / len(val_loader.dataset)
+    val_acc = accuracy_score(all_labels, all_preds)
+    val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    f1_cls = f1_score(all_labels, all_preds, labels=[0, 1], average=None, zero_division=0)
+    return val_loss, val_acc, val_f1, f1_cls
+
+
+# --- Hiperparámetros (ajusta VRAM/tiempo/curvas; N_FOLDS alto reduce varianza del CV) ---
+BATCH_SIZE = 4
+ACCUM_STEPS = 1
+PHASE_A_EPOCHS = 8
+PHASE_B_EPOCHS = 42
+LR_HEAD_PHASE_A = 1e-3
+PHASE_A_TRAIN_SWIN_NORM = True
+WD = 1e-2
+LR_SWIN_B = 3e-5
+LR_CNN_B = 5e-5
+LR_HEAD_B = 1e-4
+WARMUP_FRAC_B = 0.05
+EARLY_STOP_PATIENCE_B = 15
+N_FOLDS = 3
+TARGET_F1_CV = 0.65
+TOTAL_EPOCHS_PER_FOLD = PHASE_A_EPOCHS + PHASE_B_EPOCHS
+AMP_ENABLED = torch.cuda.is_available()
+_AMP_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+scaler = torch.amp.GradScaler(_AMP_DEVICE, enabled=AMP_ENABLED)
+
+sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+labels_arr = df_labels['label'].values
+groups_arr = df_labels['group_id'].values
+
+all_fold_metrics = []
+
+for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(
+        np.zeros(len(df_labels)), labels_arr, groups_arr)):
+
+    print(f"\n{'='*60}")
+    print(f"FOLD {fold_idx+1}/{N_FOLDS}")
+    print(f"{'='*60}")
+
+    train_df = df_labels.iloc[train_idx]
+    val_df = df_labels.iloc[val_idx]
+    print(f"Train: {len(train_df)} (pos={train_df['label'].sum()}) | "
+          f"Val: {len(val_df)} (pos={val_df['label'].sum()})")
+
+    if USE_ROI_CACHE and ROI_CACHE_READY:
+        train_ds = LUNA16CachedROIDataset(df_labels, train_idx, ROI_CACHE_DIR, augment=True)
+        val_ds = LUNA16CachedROIDataset(df_labels, val_idx, ROI_CACHE_DIR, augment=False)
+    else:
+        train_ds = LUNA16NoduleDataset(train_df, augment=True)
+        val_ds = LUNA16NoduleDataset(val_df, augment=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    try:
+        if USE_DCSWIN_STYLE:
+            model = DCSwinBStyle3D(num_classes=2, pretrained=True).to(DEVICE)
+        else:
+            raise RuntimeError()
+    except Exception:
+        model = R3D18Expert(num_classes=2).to(DEVICE)
+
+    class_w = _make_class_weight_tensor(train_df['label'].values, DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_w)
+
+    best_val_f1 = 0.0
+    best_epoch = -1
+    best_f1_per_class = None
+    history = {
+        'train_loss': [], 'val_loss': [], 'train_acc': [],
+        'val_acc': [], 'val_f1': [], 'val_f1_class0': [], 'val_f1_class1': [],
+        'phase': [], 'epoch_global': [],
+    }
+
+    epoch_global = 0
+    is_dcswin = isinstance(model, DCSwinBStyle3D)
+
+    # ---------- Fase A: congelar backbone; entrenar cabeza (y opcional norm Swin) ----------
+    if is_dcswin:
+        _freeze_dcswin_phase_a(model, train_swin_norm=PHASE_A_TRAIN_SWIN_NORM)
+    else:
+        _freeze_r3d_phase_a(model)
+
+    if is_dcswin and PHASE_A_TRAIN_SWIN_NORM:
+        opt_params = list(model.head.parameters()) + list(model.norm.parameters())
+    else:
+        opt_params = list(model.head.parameters())
+
+    optimizer = torch.optim.AdamW(opt_params, lr=LR_HEAD_PHASE_A, weight_decay=WD)
+    scheduler_a = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, PHASE_A_EPOCHS))
+
+    for epoch in range(PHASE_A_EPOCHS):
+        epoch_global += 1
+        model.train()
+        running_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        optimizer.zero_grad(set_to_none=True)
+        step_in_accum = 0
+        pbar = tqdm(train_loader, desc=f"F{fold_idx+1} A {epoch+1}/{PHASE_A_EPOCHS}", leave=True, mininterval=0.5)
+        for x, y in pbar:
+            x = x.to(DEVICE)
+            y = _labels_to_device(y, DEVICE)
+            with torch.amp.autocast(_AMP_DEVICE, enabled=AMP_ENABLED):
+                logits = model(x)
+                loss = criterion(logits, y) / ACCUM_STEPS
+            scaler.scale(loss).backward()
+            step_in_accum += 1
+            running_loss += loss.item() * ACCUM_STEPS * x.size(0)
+            pred = logits.argmax(1)
+            train_correct += (pred == y).sum().item()
+            train_total += y.size(0)
+            pbar.set_postfix(loss=f"{loss.item() * ACCUM_STEPS:.4f}")
+            if step_in_accum % ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        if step_in_accum % ACCUM_STEPS != 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        scheduler_a.step()
+        train_loss = running_loss / len(train_ds)
+        train_acc = train_correct / max(train_total, 1)
+
+        print(
+            f"  → Validación Fase A época {epoch+1}: {len(val_ds)} muestras, {len(val_loader)} batches...",
+            flush=True,
+        )
+        val_loss, val_acc, val_f1, f1_cls = _validate_epoch(
+            model, val_loader, criterion, _AMP_DEVICE, AMP_ENABLED)
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        history['val_f1_class0'].append(float(f1_cls[0]))
+        history['val_f1_class1'].append(float(f1_cls[1]))
+        history['phase'].append('A')
+        history['epoch_global'].append(epoch_global)
+
+        print(
+            f"  Fold {fold_idx+1} | A {epoch+1:3d}/{PHASE_A_EPOCHS} | "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
+            f"val_f1(macro)={val_f1:.4f} | f1_cls=[{f1_cls[0]:.4f},{f1_cls[1]:.4f}]"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_epoch = epoch_global
+            best_f1_per_class = [float(f1_cls[0]), float(f1_cls[1])]
+            ckpt_path = os.path.join(
+                WEIGHTS_DIR, 'checkpoints', f'expert4_{RUN_TAG}_fold{fold_idx}_best.pth')
+            payload = {
+                'state_dict': model.state_dict(),
+                'fold': fold_idx,
+                'epoch': best_epoch,
+                'phase': 'A',
+                'val_f1_macro': float(val_f1),
+                'val_f1_per_class': best_f1_per_class,
+                'val_acc': float(val_acc),
+                'train_loss': float(train_loss),
+                'val_loss': float(val_loss),
+                'model': 'DCSwinBStyle3D' if is_dcswin else 'R3D18',
+                'class_weights': class_w.detach().cpu().tolist(),
+            }
+            torch.save(payload, ckpt_path)
+            print(f"    → Mejor checkpoint: {ckpt_path} (val_f1={val_f1:.4f})")
+
+    # ---------- Fase B: todo descongelado; LR por grupo (Swin / CNN / head); warmup + cosine ----------
+    _unfreeze_all(model)
+    if is_dcswin:
+        param_groups = _param_groups_dcswin(model, LR_SWIN_B, LR_CNN_B, LR_HEAD_B, WD)
+    else:
+        param_groups = _param_groups_r3d(model, min(LR_SWIN_B, LR_CNN_B), LR_HEAD_B, WD)
+
+    optimizer = torch.optim.AdamW(param_groups)
+    warmup_epochs = max(1, int(PHASE_B_EPOCHS * WARMUP_FRAC_B))
+    cosine_epochs = max(1, PHASE_B_EPOCHS - warmup_epochs)
+    warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+    scheduler_b = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[warmup_epochs])
+
+    epochs_no_improve = 0
+    for epoch in range(PHASE_B_EPOCHS):
+        epoch_global += 1
+        model.train()
+        running_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        optimizer.zero_grad(set_to_none=True)
+        step_in_accum = 0
+        pbar = tqdm(train_loader, desc=f"F{fold_idx+1} B {epoch+1}/{PHASE_B_EPOCHS}", leave=True, mininterval=0.5)
+        for x, y in pbar:
+            x = x.to(DEVICE)
+            y = _labels_to_device(y, DEVICE)
+            with torch.amp.autocast(_AMP_DEVICE, enabled=AMP_ENABLED):
+                logits = model(x)
+                loss = criterion(logits, y) / ACCUM_STEPS
+            scaler.scale(loss).backward()
+            step_in_accum += 1
+            running_loss += loss.item() * ACCUM_STEPS * x.size(0)
+            pred = logits.argmax(1)
+            train_correct += (pred == y).sum().item()
+            train_total += y.size(0)
+            pbar.set_postfix(loss=f"{loss.item() * ACCUM_STEPS:.4f}")
+            if step_in_accum % ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        if step_in_accum % ACCUM_STEPS != 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        scheduler_b.step()
+        train_loss = running_loss / len(train_ds)
+        train_acc = train_correct / max(train_total, 1)
+
+        print(
+            f"  → Validación Fase B época {epoch+1}: {len(val_ds)} muestras...",
+            flush=True,
+        )
+        val_loss, val_acc, val_f1, f1_cls = _validate_epoch(
+            model, val_loader, criterion, _AMP_DEVICE, AMP_ENABLED)
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        history['val_f1_class0'].append(float(f1_cls[0]))
+        history['val_f1_class1'].append(float(f1_cls[1]))
+        history['phase'].append('B')
+        history['epoch_global'].append(epoch_global)
+
+        print(
+            f"  Fold {fold_idx+1} | B {epoch+1:3d}/{PHASE_B_EPOCHS} | "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
+            f"val_f1(macro)={val_f1:.4f} | f1_cls=[{f1_cls[0]:.4f},{f1_cls[1]:.4f}]"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_epoch = epoch_global
+            best_f1_per_class = [float(f1_cls[0]), float(f1_cls[1])]
+            ckpt_path = os.path.join(
+                WEIGHTS_DIR, 'checkpoints', f'expert4_{RUN_TAG}_fold{fold_idx}_best.pth')
+            payload = {
+                'state_dict': model.state_dict(),
+                'fold': fold_idx,
+                'epoch': best_epoch,
+                'phase': 'B',
+                'val_f1_macro': float(val_f1),
+                'val_f1_per_class': best_f1_per_class,
+                'val_acc': float(val_acc),
+                'train_loss': float(train_loss),
+                'val_loss': float(val_loss),
+                'model': 'DCSwinBStyle3D' if is_dcswin else 'R3D18',
+                'class_weights': class_w.detach().cpu().tolist(),
+            }
+            torch.save(payload, ckpt_path)
+            print(f"    → Mejor checkpoint: {ckpt_path} (val_f1={val_f1:.4f})")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if EARLY_STOP_PATIENCE_B is not None and epochs_no_improve >= EARLY_STOP_PATIENCE_B:
+                print(f"    Early stopping Fase B (sin mejora {EARLY_STOP_PATIENCE_B} épocas).")
+                break
+
+    fold_metrics = {
+        'fold': fold_idx,
+        'best_val_f1': best_val_f1,
+        'best_epoch': best_epoch,
+        'best_f1_per_class': best_f1_per_class,
+        'final_val_acc': history['val_acc'][-1],
+        'final_val_f1': history['val_f1'][-1],
+    }
+    all_fold_metrics.append(fold_metrics)
+    print(f"Fold {fold_idx+1} finalizado — mejor val_f1={best_val_f1:.4f} (época global {best_epoch})")
+
+    hist_path = os.path.join(WEIGHTS_DIR, 'metrics', f'history_{RUN_TAG}_fold_{fold_idx}.json')
+    with open(hist_path, 'w') as f:
+        json.dump(history, f, indent=2)
+
+print(f"\n{'='*60}")
+print("RESUMEN CROSS-VALIDATION")
+print(f"{'='*60}")
+f1s = [m['best_val_f1'] for m in all_fold_metrics]
+print(f"F1 macro por fold: {[f'{v:.4f}' for v in f1s]}")
+print(f"Media ± std: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
+print(
+    f"Objetivo referencia (criterio sobre media CV, no un solo fold afortunado): "
+    f"F1 macro > {TARGET_F1_CV} → "
+    f"{'cumplido (media)' if np.mean(f1s) > TARGET_F1_CV else 'pendiente (revisa folds/LR/épocas)'}."
+)
+summary_path = os.path.join(WEIGHTS_DIR, 'metrics', f'cv_summary_{RUN_TAG}.json')
+with open(summary_path, 'w') as f:
+    json.dump(all_fold_metrics, f, indent=2)
+print(f"Resumen guardado en {summary_path}")
+
+
+--- CELL 9 ---
+# Fase 6: Evaluación detallada del mejor fold
+if 'RUN_TAG' not in globals():
+    RUN_TAG = 'twophase_wce_v1'
+
+best_fold = max(all_fold_metrics, key=lambda m: m['best_val_f1'])
+best_fold_idx = best_fold['fold']
+print(f"Mejor fold: {best_fold_idx} (F1={best_fold['best_val_f1']:.4f})")
+
+# Cargar modelo del mejor fold (checkpoint puede ser dict con 'state_dict' o tensor plano legacy)
+ckpt = os.path.join(WEIGHTS_DIR, 'checkpoints', f'expert4_{RUN_TAG}_fold{best_fold_idx}_best.pth')
+if not os.path.isfile(ckpt):
+    _alt = os.path.join(WEIGHTS_DIR, 'checkpoints', f'expert4_fold{best_fold_idx}_best.pth')
+    ckpt = _alt if os.path.isfile(_alt) else ckpt
+if not os.path.isfile(ckpt):
+    raise FileNotFoundError(
+        f"No existe el checkpoint (ni expert4_{RUN_TAG}_fold{best_fold_idx}_best ni legacy). "
+        f"Entrena la Fase 5 o revisa WEIGHTS_DIR / RUN_TAG."
+    )
+try:
+    _blob = torch.load(ckpt, map_location=DEVICE, weights_only=False)
+except TypeError:
+    _blob = torch.load(ckpt, map_location=DEVICE)
+_mname = _blob.get('model') if isinstance(_blob, dict) else None
+if _mname == 'R3D18':
+    eval_model = R3D18Expert(num_classes=2).to(DEVICE)
+elif _mname == 'DCSwinBStyle3D' or USE_DCSWIN_STYLE:
+    eval_model = DCSwinBStyle3D(num_classes=2, pretrained=False).to(DEVICE)
+else:
+    eval_model = R3D18Expert(num_classes=2).to(DEVICE)
+_state = _blob['state_dict'] if isinstance(_blob, dict) and 'state_dict' in _blob else _blob
+eval_model.load_state_dict(_state)
+eval_model.eval()
+
+# Reconstruir val del mejor fold
+_, val_idx_best = list(sgkf.split(np.zeros(len(df_labels)), labels_arr, groups_arr))[best_fold_idx]
+val_df_best = df_labels.iloc[val_idx_best]
+if USE_ROI_CACHE and ROI_CACHE_READY:
+    val_ds_best = LUNA16CachedROIDataset(df_labels, val_idx_best, ROI_CACHE_DIR, augment=False)
+else:
+    val_ds_best = LUNA16NoduleDataset(val_df_best, augment=False)
+val_loader_best = DataLoader(val_ds_best, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+all_preds, all_labels, all_probs = [], [], []
+with torch.no_grad():
+    for x, y in tqdm(val_loader_best, desc="Evaluación"):
+        x = x.to(DEVICE)
+        logits = eval_model(x)
+        probs = F.softmax(logits, dim=1)
+        all_preds.extend(logits.argmax(1).cpu().numpy())
+        if isinstance(y, torch.Tensor):
+            y_np = y.detach().cpu().numpy()
+        else:
+            y_np = np.asarray(y)
+        all_labels.extend(y_np.reshape(-1).tolist())
+        all_probs.extend(probs[:, 1].cpu().numpy())
+
+all_labels = np.array(all_labels)
+all_preds = np.array(all_preds)
+
+print("\n" + classification_report(all_labels, all_preds, target_names=["Benigno", "Maligno"]))
+
+cm = confusion_matrix(all_labels, all_preds)
+print("Confusion Matrix:")
+print(cm)
+
+# AUC si hay ambas clases
+if len(np.unique(all_labels)) == 2:
+    auc = roc_auc_score(all_labels, all_probs)
+    print(f"AUC-ROC: {auc:.4f}")
+
+# Guardar
+eval_metrics = {
+    'accuracy': float(accuracy_score(all_labels, all_preds)),
+    'precision_macro': float(precision_score(all_labels, all_preds, average='macro', zero_division=0)),
+    'recall_macro': float(recall_score(all_labels, all_preds, average='macro', zero_division=0)),
+    'f1_macro': float(f1_score(all_labels, all_preds, average='macro', zero_division=0)),
+    'confusion_matrix': cm.tolist(),
+}
+with open(os.path.join(WEIGHTS_DIR, 'metrics', 'eval_best_fold.json'), 'w') as f:
+    json.dump(eval_metrics, f, indent=2)
+

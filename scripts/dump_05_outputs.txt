@@ -1,0 +1,79 @@
+--- Cell 1 output ---
+Drive already mounted at /content/drive; to attempt to forcibly remount, call drive.mount("/content/drive", force_remount=True).
+Rutas (datasets tras extracción en LOCAL_DEST):
+  NIH id=0 exists=True -> /content/datasets/NIH Chest X ray 14
+  ISIC id=1 exists=True -> /content/datasets/ISIC 2019
+  Osteo id=2 exists=True -> /content/datasets/Knee Osteoarthritis Classification
+  LUNA16 id=3 exists=True -> /content/datasets/Luna16 Lung Cancer Dataset
+  Pancreas id=4 exists=True -> /content/datasets/Pancreas Cancer
+RAW_DIR=/content/drive/MyDrive/PROYECTO_MOE_VISION/01_Data/Raw/
+LOCAL_DEST=/content/datasets/
+WEIGHTS_DIR=/content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/
+
+--- Cell 3 output ---
+Encontrados 5 zips.
+============================================================
+Procesando: ISIC 2019.zip
+ Ya existe: /content/datasets/ISIC 2019 (omitido).
+============================================================
+Procesando: Knee Osteoarthritis Classification.zip
+ Ya existe: /content/datasets/Knee Osteoarthritis Classification (omitido).
+============================================================
+Procesando: Luna16 Lung Cancer Dataset.zip
+ Ya existe: /content/datasets/Luna16 Lung Cancer Dataset (omitido).
+============================================================
+Procesando: NIH Chest X ray 14.zip
+ Ya existe: /content/datasets/NIH Chest X ray 14 (omitido).
+============================================================
+Procesando: Pancreas Cancer.zip
+ Ya existe: /content/datasets/Pancreas Cancer (omitido).
+
+Extracción completa.
+
+--- Cell 17 output ---
+✅ ¡El archivo ya existe! Saltando extracción.
+Ruta: /content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/unified_cls_tokens.npz
+Contenido: Z_train (3556, 192), Z_val (890, 192)
+📦 Detectado peso comprimido: exp2_ISIC_EfficientNetB3_best.pth.zip
+  → Descomprimiendo en /content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights...
+=== Expert Load Report ===
+Exp1 | exp1_nih | arch=swin_tiny_nih | OK | params=27,523,199 | ckpt=/content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/Experts_2D/MaxViT_NIH_5cls.pth
+Exp2 | exp2_isic | arch=efficientnet_b3 | OK | params=10,710,065 | ckpt=/content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/exp1_NIH_LungMaxViT_best.pth
+Exp3 | exp3_osteo | arch=vgg16_bn | OK | params=27,701,701 | ckpt=/content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/exp3_Osteo_VGG16BN_best.pth
+Exp4 | exp4_luna16 | arch=dcswinb3d | OK | params=29,535,548 | ckpt=/content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/Experts_2D/Expert4_LUNA16/checkpoints/expert4_twophase_wce_v1_fold1_best.pth
+Exp5 | exp5_pancreas | arch=r3d18 | OK | params=33,148,482 | ckpt=/content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/exp5_Pancreas_3D_best.pth
+ExpertsPinnedGPU: 5 modelos en cuda | VRAM delta ~0.50 GiB (aprox., solo expertos)
+  [NIH filter] 27,941 imágenes con al menos 1 de {'Cardiomegaly', 'Mass', 'Nodule', 'Effusion', 'Pneumothorax'}
+  [NIH] filtrado: 112,120 → 27,941 imágenes (5 clases del Experto)
+[NIH] n=1000 (id=0)
+[ISIC] n=1000 (id=1)
+[Osteo] n=1000 (id=2)
+[LUNA16] n=889 (id=3)
+[Pancreas] n=557 (id=4)
+
+--- Cell 17 output ---
+Loader balanceado listo: N=4446, batch_size=4, task_labels=True
+Conteo por dominio: {0: 1000, 1: 1000, 2: 1000, 3: 889, 4: 557}
+[fit_router_with_eval] pesos del router en: cuda:0 (objetivo: cuda)
+  Flujo del profesor activo: 5 expertos en forward de entrenamiento.
+[head_only] Ep 1/6  train_acc=0.5549 val_acc=0.6989  ratio=62.143 ent=1.175  aux=1.5509 vram_mb=1328.8
+  → mejor ckpt guardado ep 1 (score=-0.5180): /content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/router_professor_fase3_only.pth
+[head_only] Ep 2/6  train_acc=0.5972 val_acc=0.5888  ratio=565168559.551 ent=1.100  aux=1.6238 vram_mb=1329.8
+[head_only] Ep 3/6  train_acc=0.6118 val_acc=0.7764  ratio=6.654 ent=1.085  aux=1.6014 vram_mb=1328.8
+  → mejor ckpt guardado ep 3 (score=0.6693): /content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/router_professor_fase3_only.pth
+[head_only] Ep 4/6  train_acc=0.6500 val_acc=0.6247  ratio=305617988.110 ent=1.080  aux=1.5804 vram_mb=1329.8
+[head_only] Ep 5/6  train_acc=0.6538 val_acc=0.5989  ratio=407865166.664 ent=1.058  aux=1.5156 vram_mb=1329.3
+[head_only] Ep 6/6  train_acc=0.6748 val_acc=0.6281  ratio=392134845.257 ent=1.074  aux=1.5401 vram_mb=1328.8
+Listo. Checkpoint: /content/drive/MyDrive/PROYECTO_MOE_VISION/03_Weights/router_professor_fase3_only.pth
+
+--- Cell 18 output ---
+=== Verificación dispositivos ===
+Objetivo: cuda
+Router (primer parámetro): cuda:0
+  Experto 1: cuda:0
+  Experto 2: cuda:0
+  Experto 3: cuda:0
+  Experto 4: cuda:0
+  Experto 5: cuda:0
+VRAM actual — allocated: 1.10 GiB | reserved: 1.40 GiB
+

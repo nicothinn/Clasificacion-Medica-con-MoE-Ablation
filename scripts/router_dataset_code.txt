@@ -1,0 +1,1313 @@
+
+--- CELL 5 ---
+class AdaptivePreprocessor:
+    """Carga archivos y retorna tensores nativos (2D o 3D)."""
+    def __init__(self, size_2d=(224, 224), size_3d=(64, 64, 64), hu_window_ct=(-1000, 400)):
+        self.size_2d = size_2d
+        self.size_3d = size_3d
+        self.hu_min, self.hu_max = hu_window_ct
+
+    def __call__(self, file_path):
+        ext = file_path.lower()
+        if ext.endswith(('.png', '.jpg', '.jpeg')): return self._process_2d(file_path)
+        if ext.endswith('.mha'):                     return self._process_mha(file_path)
+        if ext.endswith(('.mhd', '.nii.gz', '.nii')): return self._process_3d(file_path)
+        raise ValueError(f'Formato no soportado: {file_path}')
+
+    def _process_2d(self, path):
+        img = Image.open(path).convert('RGB')
+        transform = T.Compose([T.Resize(self.size_2d), T.ToTensor()])
+        return transform(img)
+
+    def _process_mha(self, path):
+        itk_img = sitk.ReadImage(path)
+        size = itk_img.GetSize()
+        arr = sitk.GetArrayFromImage(itk_img).astype(np.float32)
+        if len(size) == 2:                       return self._array_2d_to_tensor(arr)
+        if len(size) == 3 and size[2] <= 1:
+            arr = np.squeeze(arr)
+            if arr.ndim == 2:                    return self._array_2d_to_tensor(arr)
+        return self._volume_array_to_tensor(arr, path)
+
+    def _array_2d_to_tensor(self, arr):
+        if arr.max() > 1.5:
+            arr = arr / 255.0 if arr.max() > 2.0 else (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+        t = torch.from_numpy(arr).unsqueeze(0)
+        if t.shape[1:] != torch.Size(self.size_2d):
+            t = F.interpolate(t.unsqueeze(0), size=self.size_2d, mode='bilinear', align_corners=False).squeeze(0)
+        if t.shape[0] == 1:  t = t.repeat(3, 1, 1)
+        elif t.shape[0] > 3: t = t[:3]
+        return t
+
+    def _volume_array_to_tensor(self, img_arr, path_hint=''):
+        amin, amax = float(np.nanmin(img_arr)), float(np.nanmax(img_arr))
+        pre_norm = amax <= 1.5 and amin >= -1e-2 and 'Pancreas' in str(path_hint).replace('\\', '/')
+        if not pre_norm:
+            img_arr = np.clip(img_arr, self.hu_min, self.hu_max)
+            img_arr = (img_arr - self.hu_min) / (self.hu_max - self.hu_min + 1e-8)
+        else:
+            img_arr = np.clip(img_arr, 0.0, 1.0)
+        t = torch.tensor(img_arr, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=self.size_3d, mode='trilinear', align_corners=False)
+        return t.squeeze(0)  # [1, 64, 64, 64]
+
+    def _process_3d(self, path):
+        if path.endswith('.mhd'):
+            itk_img = sitk.ReadImage(path)
+            img_arr = sitk.GetArrayFromImage(itk_img).astype(np.float32)
+        else:
+            nii_img = nib.load(path)
+            img_arr = np.transpose(nii_img.get_fdata().astype(np.float32), (2, 1, 0))
+        return self._volume_array_to_tensor(img_arr, path_hint=path)
+
+preprocessor = AdaptivePreprocessor()
+print('AdaptivePreprocessor listo.')
+
+VALID_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.mha', '.mhd', '.nii', '.nii.gz')
+
+def scan_dataset_files(root_path, max_files=None):
+    """Escanea recursivamente y retorna paths de archivos médicos válidos."""
+    files = []
+    for dirpath, _, filenames in os.walk(root_path):
+        for fname in sorted(filenames):
+            if fname.lower().endswith(VALID_EXTENSIONS):
+                files.append(os.path.join(dirpath, fname))
+    if max_files:
+        files = files[:max_files]
+    return files
+
+# (opcional) contar archivos:
+# for name, (path, did) in DATASET_ROOTS.items():
+#     print(name, len(scan_dataset_files(path)) if os.path.isdir(path) else 'missing')
+
+
+--- CELL 6 ---
+# =============================================================================
+# Filtrado NIH: solo imágenes con al menos una de las 5 clases del Experto 1
+# =============================================================================
+import pandas as pd
+
+NIH_EXPERT_5_CLASSES = {"Mass", "Nodule", "Effusion", "Cardiomegaly", "Pneumothorax"}
+
+
+def build_nih_filtered_fileset(nih_root: str) -> set:
+    """
+    Lee el CSV de NIH y retorna un set con los nombres de archivo (basename)
+    que tienen al menos una de las 5 clases del Experto 1.
+    Si el CSV no se encuentra, retorna set vacío (sin filtro).
+    """
+    csv_candidates = glob.glob(os.path.join(nih_root, "**", "*.csv"), recursive=True)
+    nih_csv = next(
+        (
+            c
+            for c in csv_candidates
+            if "data_entry" in os.path.basename(c).lower() and "2017" in os.path.basename(c).lower()
+        ),
+        None,
+    )
+    if nih_csv is None:
+        print("  [NIH filter] CSV no encontrado → sin filtro aplicado.")
+        return set()
+
+    try:
+        df = pd.read_csv(nih_csv)
+    except Exception:
+        print("  [NIH filter] no se pudo leer el CSV → sin filtro aplicado.")
+        return set()
+    if "Image Index" not in df.columns or "Finding Labels" not in df.columns:
+        print("  [NIH filter] CSV inválido → sin filtro aplicado.")
+        return set()
+
+    valid_filenames = set()
+    for _, row in df.iterrows():
+        labels = {l.strip() for l in str(row["Finding Labels"]).split("|") if l.strip()}
+        if labels & NIH_EXPERT_5_CLASSES:
+            valid_filenames.add(str(row["Image Index"]))
+
+    print(f"  [NIH filter] {len(valid_filenames):,} imágenes con al menos 1 de {NIH_EXPERT_5_CLASSES}")
+    return valid_filenames
+
+
+print("Filtro NIH (5 clases del Experto 1) definido.")
+
+
+--- CELL 7 ---
+import pandas as pd
+
+# -------- Etiquetas por dataset (misma lógica de notebooks de expertos) --------
+NIH_CLASSES_14 = [
+    'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Effusion',
+    'Emphysema', 'Fibrosis', 'Hernia', 'Infiltration', 'Mass', 'Nodule',
+    'Pleural_Thickening', 'Pneumonia', 'Pneumothorax'
+]
+ISIC_CLASSES_8 = ['MEL', 'NV', 'BCC', 'AK', 'BKL', 'DF', 'VASC', 'SCC']
+
+
+def _safe_read_csv(path):
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return None
+
+
+def build_dataset_label_index(roots):
+    """
+    Construye índices de etiquetas por dataset para usar en el loader mixto.
+    - NIH: multi-label (14) desde Data_Entry* (Finding Labels).
+    - ISIC: single-label (8) desde CSV one-hot (MEL..SCC), excluye UNK.
+    - Osteo: clase KL desde carpeta padre (0..4).
+    - LUNA16: label binario por seriesuid desde candidates*.csv (class 0/1), agregado por serie.
+    - Pancreas: label en NPZ (si aplica) o inferencia por nombre/ruta.
+    """
+    idx = {'nih': {}, 'isic': {}, 'osteo': {}, 'luna16': {}, 'meta': {}}
+
+    # NIH
+    nih_root = roots.get('NIH', (None, None))[0]
+    if nih_root and os.path.isdir(nih_root):
+        nih_csv = None
+        for c in glob.glob(os.path.join(nih_root, '**', '*.csv'), recursive=True):
+            bn = os.path.basename(c).lower()
+            if 'data_entry' in bn and '2017' in bn:
+                nih_csv = c
+                break
+        if nih_csv:
+            df = _safe_read_csv(nih_csv)
+            if df is not None and 'Image Index' in df.columns and 'Finding Labels' in df.columns:
+                for _, r in df.iterrows():
+                    img = str(r['Image Index'])
+                    labels_txt = str(r['Finding Labels'])
+                    vec = np.zeros(len(NIH_CLASSES_14), dtype=np.float32)
+                    toks = [t.strip() for t in labels_txt.split('|') if t.strip()]
+                    for i, cls in enumerate(NIH_CLASSES_14):
+                        vec[i] = 1.0 if cls in toks else 0.0
+                    idx['nih'][img] = vec
+                idx['meta']['nih_csv'] = nih_csv
+
+    # ISIC
+    isic_root = roots.get('ISIC', (None, None))[0]
+    if isic_root and os.path.isdir(isic_root):
+        isic_csv = None
+        for c in glob.glob(os.path.join(isic_root, '**', '*.csv'), recursive=True):
+            df = _safe_read_csv(c)
+            if df is not None and all(col in df.columns for col in ISIC_CLASSES_8):
+                isic_csv = c
+                break
+        if isic_csv:
+            df = _safe_read_csv(isic_csv)
+            if df is not None:
+                if 'UNK' in df.columns:
+                    df = df[df['UNK'] != 1.0].reset_index(drop=True)
+                img_col = df.columns[0]
+                avail = [c for c in ISIC_CLASSES_8 if c in df.columns]
+                for _, r in df.iterrows():
+                    name = str(r[img_col])
+                    row = r[avail].to_numpy(dtype=np.float32)
+                    if len(row) == len(ISIC_CLASSES_8):
+                        lbl = int(np.argmax(row))
+                        idx['isic'][name] = lbl
+                idx['meta']['isic_csv'] = isic_csv
+
+    # Osteoarthritis: indice explicito identico al notebook de entrenamiento
+    # Estructura: root/KLGrade/KLGrade/0..4/imagen.jpg (o .mha tras conversion)
+    osteo_root = roots.get('Osteo', (None, None))[0]
+    if osteo_root and os.path.isdir(osteo_root):
+        # Intenta la ruta doble KLGrade/KLGrade (estructura original del zip)
+        klgrade_dir = os.path.join(osteo_root, 'KLGrade', 'KLGrade')
+        if not os.path.isdir(klgrade_dir):
+            # Fallback: puede estar ya en la raiz o un nivel
+            klgrade_dir = os.path.join(osteo_root, 'KLGrade')
+        if not os.path.isdir(klgrade_dir):
+            klgrade_dir = osteo_root
+        for grade_folder in sorted(os.listdir(klgrade_dir)):
+            gp = os.path.join(klgrade_dir, grade_folder)
+            if not os.path.isdir(gp):
+                continue
+            try:
+                grade = int(grade_folder)
+            except ValueError:
+                continue
+            if grade not in [0, 1, 2, 3, 4]:
+                continue
+            for fname in os.listdir(gp):
+                fpath = os.path.normpath(os.path.join(gp, fname))
+                idx['osteo'][fpath] = grade
+        idx['meta']['osteo_dir'] = klgrade_dir
+
+    # LUNA16 (por serie)
+    luna_root = roots.get('LUNA16', (None, None))[0]
+    if luna_root and os.path.isdir(luna_root):
+        cand = None
+        all_csv = glob.glob(os.path.join(luna_root, '**', '*.csv'), recursive=True)
+        cand = next((c for c in all_csv if 'candidates_v2' in os.path.basename(c).lower()), None)
+        if cand is None:
+            cand = next((c for c in all_csv if 'candidates' in os.path.basename(c).lower()), None)
+        if cand:
+            df = _safe_read_csv(cand)
+            if df is not None:
+                cols_map = {c.lower(): c for c in df.columns}
+                if 'seriesuid' in cols_map and 'class' in cols_map:
+                    s_col = cols_map['seriesuid']
+                    c_col = cols_map['class']
+                    df[c_col] = pd.to_numeric(df[c_col], errors='coerce').fillna(0).astype(int)
+                    # Agregado por serie para mapear volumen completo -> etiqueta binaria
+                    agg = df.groupby(s_col)[c_col].max().to_dict()
+                    idx['luna16'] = {str(k): int(v) for k, v in agg.items()}
+                    idx['meta']['luna_csv'] = cand
+
+    return idx
+
+
+def _infer_osteo_label_from_path(path):
+    parts = os.path.normpath(path).split(os.sep)
+    for p in reversed(parts):
+        if p.isdigit() and int(p) in [0, 1, 2, 3, 4]:
+            return int(p)
+        up = p.upper()
+        if up.startswith('KL') and up[2:].isdigit():
+            v = int(up[2:])
+            if v in [0, 1, 2, 3, 4]:
+                return v
+    return None
+
+
+def _infer_pancreas_label_from_path_or_npz(path):
+    low = path.lower()
+    if low.endswith('.npz'):
+        try:
+            d = np.load(path)
+            if 'label' in d:
+                return int(d['label'])
+            if 'y' in d:
+                return int(d['y'])
+        except Exception:
+            pass
+    # fallback por nombre/carpeta
+    pos_tokens = ['cancer', 'tumor', 'positive', 'pdac', 'malig']
+    neg_tokens = ['normal', 'negative', 'benign', 'non_tumor']
+    if any(t in low for t in pos_tokens):
+        return 1
+    if any(t in low for t in neg_tokens):
+        return 0
+    return None
+
+
+def resolve_task_label(path, dataset_id, label_index):
+    """Devuelve etiqueta de tarea por muestra según dataset experto."""
+    p = os.path.normpath(path)
+    fname = os.path.basename(p)
+    stem = os.path.splitext(fname)[0]
+
+    if dataset_id == 0:  # NIH multilabel (14)
+        vec = label_index['nih'].get(fname)
+        if vec is None:
+            # fallback por stem por si hay extensión distinta
+            for k, v in label_index['nih'].items():
+                if os.path.splitext(k)[0] == stem:
+                    vec = v
+                    break
+        return vec
+
+    if dataset_id == 1:  # ISIC 8 clases
+        lbl = label_index['isic'].get(stem)
+        if lbl is None:
+            # fallback si viene con .jpg en el CSV
+            lbl = label_index['isic'].get(fname)
+        return lbl
+
+    if dataset_id == 2:  # Osteo KL — indice explicito primero, heuristica como fallback
+        lbl = label_index.get('osteo', {}).get(p)
+        if lbl is None:
+            lbl = _infer_osteo_label_from_path(p)
+        return lbl
+
+    if dataset_id == 3:  # LUNA16 binario por seriesuid
+        seriesuid = stem
+        return label_index['luna16'].get(seriesuid)
+
+    if dataset_id == 4:  # Pancreas binario
+        return _infer_pancreas_label_from_path_or_npz(p)
+
+    return None
+
+
+class MixedMedicalDataset(torch.utils.data.Dataset):
+    """Dataset unificado: mezcla 2D/3D y opcionalmente devuelve etiqueta de tarea por dataset."""
+    def __init__(self, file_list, dataset_ids, preprocessor, label_index=None, include_task_label=False):
+        self.file_list = file_list
+        self.dataset_ids = dataset_ids
+        self.preprocessor = preprocessor
+        self.label_index = label_index
+        self.include_task_label = include_task_label
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        fpath = self.file_list[idx]
+        did = int(self.dataset_ids[idx])
+        tensor = self.preprocessor(fpath)
+        if not self.include_task_label:
+            return tensor, did
+
+        tlabel = resolve_task_label(fpath, did, self.label_index if self.label_index is not None else {})
+        return tensor, did, tlabel, fpath
+
+
+def mixed_collate_fn(batch):
+    """
+    Collate personalizado (Punto C).
+    - modo clásico: retorna (tensors, dataset_ids)
+    - modo extendido: retorna (tensors, dataset_ids, task_labels, paths)
+    """
+    tensors = [b[0] for b in batch]
+    dataset_ids = torch.tensor([b[1] for b in batch], dtype=torch.long)
+
+    if len(batch[0]) == 2:
+        return tensors, dataset_ids
+
+    task_labels = [b[2] for b in batch]
+    paths = [b[3] for b in batch]
+    return tensors, dataset_ids, task_labels, paths
+
+def build_router_dataloader_weighted(
+    roots,
+    preprocessor,
+    *,
+    batch_size=8,
+    num_workers=2,
+    sample_cap=1000,
+    include_task_label: bool = False,
+):
+    """Loader balanceado por WeightedRandomSampler.
+
+    include_task_label=True: el batch devuelve (tensors, expert_ids, task_labels, paths)
+    lo que activa el flujo del profesor en train_router_one_epoch.
+    NIH: opcionalmente filtra a imágenes con al menos una de las 5 clases del Experto 1.
+    """
+    all_files, all_ids = [], []
+    nih_root = roots.get("NIH", (None, None))[0]
+    nih_valid_set = build_nih_filtered_fileset(nih_root) if nih_root and os.path.isdir(nih_root) else set()
+    for name, (path, did) in roots.items():
+        files = scan_dataset_files(path)
+        if name == "NIH" and nih_valid_set:
+            before = len(files)
+            files = [f for f in files if os.path.basename(f) in nih_valid_set]
+            print(f"  [NIH] filtrado: {before:,} → {len(files):,} imágenes (5 clases del Experto)")
+        if sample_cap is not None and len(files) > sample_cap:
+            random.seed(42)
+            files = random.sample(files, sample_cap)
+        all_files.extend(files)
+        all_ids.extend([did] * len(files))
+        print(f"[{name}] n={len(files)} (id={did})")
+
+    label_index = build_dataset_label_index(roots) if include_task_label else None
+    dataset = MixedMedicalDataset(
+        all_files, all_ids, preprocessor,
+        label_index=label_index,
+        include_task_label=include_task_label,
+    )
+    counts = Counter(all_ids)
+    weights = [1.0 / counts[did] for did in all_ids]
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(all_ids),
+        replacement=True,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        collate_fn=mixed_collate_fn,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    print(f'Loader balanceado listo: N={len(dataset)}, batch_size={batch_size}, task_labels={include_task_label}')
+    print(f'Conteo por dominio: {dict(counts)}')
+    return loader, counts
+
+print('Dataset + build_router_dataloader_weighted listo.')
+
+
+--- CELL 9 ---
+# --- Export: 1 archivo ORIGINAL por ETIQUETA DE TAREA (misma lógica que el loader) ---
+# Requiere: NIH_CLASSES_14, ISIC_CLASSES_8, build_dataset_label_index, resolve_task_label,
+#           _infer_pancreas_label_from_path_or_npz, scan_dataset_files, DATASET_ROOTS
+
+
+def _companions_for_mhd(mhd_path):
+    stem = os.path.splitext(mhd_path)[0]
+    extra = []
+    for ext in (".raw", ".zraw", ".RAW", ".ZRAW"):
+        p = stem + ext
+        if os.path.isfile(p):
+            extra.append(p)
+    return extra
+
+
+def _is_2d_file(path):
+    return path.lower().endswith((".png", ".jpg", ".jpeg"))
+
+
+def _is_3d_volume_file(path):
+    low = path.lower()
+    if low.endswith(".nii.gz"):
+        return True
+    return low.endswith((".nii", ".mha", ".mhd"))
+
+
+def _luna_volume_matches_seriesuid(fp, seriesuid):
+    bn = os.path.basename(fp)
+    stem = os.path.splitext(bn)[0]
+    su = str(seriesuid).strip()
+    if su and (stem == su or su in bn):
+        return True
+    return False
+
+
+def _safe_prefix(expert_index, dataset_name, task_slug):
+    ds = dataset_name.replace(" ", "_")
+    t = "".join(c if c.isalnum() or c in "._-" else "_" for c in task_slug)[:120]
+    return f"{int(expert_index):d}_{ds}_{t}_"
+
+
+def _copy_row(
+    primary,
+    base,
+    expert_index,
+    dataset_name,
+    task_slug,
+    rows,
+    task_label_index=None,
+    task_label_name=None,
+):
+    to_copy = [primary]
+    if primary.lower().endswith(".mhd"):
+        to_copy.extend(_companions_for_mhd(primary))
+    saved_rels = []
+    pref = _safe_prefix(expert_index, dataset_name, task_slug)
+    for src in to_copy:
+        bn = os.path.basename(src)
+        dst_name = pref + bn
+        shutil.copy2(src, os.path.join(base, dst_name))
+        saved_rels.append(dst_name)
+    ext = os.path.splitext(primary)[1].lower()
+    modality = "2D" if ext in (".png", ".jpg", ".jpeg") else "3D"
+    rows.append(
+        {
+            "expert_index_router": int(expert_index),
+            "dataset_name": dataset_name,
+            "task_slug": task_slug,
+            "task_label_index": task_label_index if task_label_index is not None else "",
+            "task_label_name": task_label_name if task_label_name is not None else "",
+            "modality_guess": modality,
+            "primary_source_path": primary,
+            "saved_files": ";".join(saved_rels),
+            "status": "ok",
+        }
+    )
+
+
+def _append_missing(rows, expert_index, dataset_name, task_slug, reason, tidx=None, tname=None):
+    rows.append(
+        {
+            "expert_index_router": int(expert_index),
+            "dataset_name": dataset_name,
+            "task_slug": task_slug,
+            "task_label_index": tidx if tidx is not None else "",
+            "task_label_name": tname if tname is not None else "",
+            "modality_guess": "",
+            "primary_source_path": "",
+            "saved_files": "",
+            "status": reason,
+        }
+    )
+
+
+def export_dashboard_raw_samples_by_task_label(roots=None, out_dir=None, label_index=None):
+    """
+    Una muestra por cada etiqueta de tarea según el índice del notebook.
+
+    - NIH: 14 (vector Data_Entry con positivo en dim i)
+    - ISIC: 8 clases
+    - Osteo: KL 0..4
+    - LUNA16: binario 0/1
+    - Pancreas: binario 0/1
+    """
+    roots = roots or DATASET_ROOTS
+    if label_index is None:
+        label_index = build_dataset_label_index(roots)
+    base = out_dir or os.path.join(LOCAL_DEST, "dashboard_raw_samples")
+    os.makedirs(base, exist_ok=True)
+    rows = []
+
+    # -------- NIH: 14 hallazgos --------
+    nih_root = roots.get("NIH", (None, None))[0]
+    if nih_root and os.path.isdir(nih_root):
+        nih_files = [f for f in sorted(scan_dataset_files(nih_root)) if _is_2d_file(f)]
+        for ci, cname in enumerate(NIH_CLASSES_14):
+            slug = f"nih14_{ci:02d}_{cname}"
+            chosen = None
+            for fp in nih_files:
+                vec = resolve_task_label(fp, 0, label_index)
+                if vec is None:
+                    continue
+                v = np.asarray(vec).ravel()
+                if v.size > ci and float(v[ci]) >= 0.5:
+                    chosen = fp
+                    break
+            if chosen is None:
+                _append_missing(rows, 0, "NIH", slug, "no_file_for_task_label", ci, cname)
+            else:
+                _copy_row(chosen, base, 0, "NIH", slug, rows, ci, cname)
+    else:
+        for ci, cname in enumerate(NIH_CLASSES_14):
+            _append_missing(rows, 0, "NIH", f"nih14_{ci:02d}_{cname}", "missing_root", ci, cname)
+
+    # -------- ISIC: 8 --------
+    isic_root = roots.get("ISIC", (None, None))[0]
+    if isic_root and os.path.isdir(isic_root):
+        isic_files = [f for f in sorted(scan_dataset_files(isic_root)) if _is_2d_file(f)]
+        stems_by_lbl = {}
+        for stem, lbl in label_index.get("isic", {}).items():
+            stems_by_lbl.setdefault(int(lbl), []).append(stem)
+        for ci, cname in enumerate(ISIC_CLASSES_8):
+            slug = f"isic8_{ci}_{cname}"
+            stems = sorted(stems_by_lbl.get(ci, []))
+            chosen = None
+            for st in stems:
+                for fp in isic_files:
+                    bn = os.path.basename(fp)
+                    bstem = os.path.splitext(bn)[0]
+                    if bstem == st or bn == st or st in bn:
+                        chosen = fp
+                        break
+                if chosen is not None:
+                    break
+            if chosen is None:
+                _append_missing(rows, 1, "ISIC", slug, "no_file_for_task_label", ci, cname)
+            else:
+                _copy_row(chosen, base, 1, "ISIC", slug, rows, ci, cname)
+    else:
+        for ci, cname in enumerate(ISIC_CLASSES_8):
+            _append_missing(rows, 1, "ISIC", f"isic8_{ci}_{cname}", "missing_root", ci, cname)
+
+    # -------- Osteo: KL 0..4 --------
+    osteo_root = roots.get("Osteo", (None, None))[0]
+    if osteo_root and os.path.isdir(osteo_root):
+        for g in range(5):
+            slug = f"osteo_kl_{g}"
+            paths_g = [p for p, v in label_index.get("osteo", {}).items() if int(v) == g]
+            chosen = sorted(paths_g)[0] if paths_g else None
+            if chosen is None or not os.path.isfile(chosen):
+                _append_missing(rows, 2, "Osteo", slug, "no_file_for_task_label", g, f"KL{g}")
+            else:
+                _copy_row(chosen, base, 2, "Osteo", slug, rows, g, f"KL{g}")
+    else:
+        for g in range(5):
+            _append_missing(rows, 2, "Osteo", f"osteo_kl_{g}", "missing_root", g, f"KL{g}")
+
+    # -------- LUNA16: binario --------
+    luna_root = roots.get("LUNA16", (None, None))[0]
+    if luna_root and os.path.isdir(luna_root):
+        vol_files = [f for f in sorted(scan_dataset_files(luna_root)) if _is_3d_volume_file(f)]
+        for cls in (0, 1):
+            slug = f"luna_bin_{cls}"
+            suids = [k for k, v in label_index.get("luna16", {}).items() if int(v) == cls]
+            if not suids:
+                _append_missing(rows, 3, "LUNA16", slug, "no_series_for_label", cls, str(cls))
+                continue
+            s0 = sorted(suids)[0]
+            chosen = None
+            for fp in vol_files:
+                if _luna_volume_matches_seriesuid(fp, s0):
+                    chosen = fp
+                    break
+            if chosen is None:
+                _append_missing(rows, 3, "LUNA16", slug, "no_file_for_task_label", cls, str(cls))
+            else:
+                _copy_row(chosen, base, 3, "LUNA16", slug, rows, cls, str(cls))
+    else:
+        for cls in (0, 1):
+            _append_missing(rows, 3, "LUNA16", f"luna_bin_{cls}", "missing_root", cls, str(cls))
+
+    # -------- Pancreas: binario --------
+    pan_root = roots.get("Pancreas", (None, None))[0]
+    if pan_root and os.path.isdir(pan_root):
+        for cls in (0, 1):
+            slug = f"pancreas_bin_{cls}"
+            chosen = None
+            for fp in sorted(scan_dataset_files(pan_root)):
+                if not _is_3d_volume_file(fp):
+                    continue
+                lb = _infer_pancreas_label_from_path_or_npz(fp)
+                if lb is not None and int(lb) == cls:
+                    chosen = fp
+                    break
+            if chosen is None:
+                _append_missing(rows, 4, "Pancreas", slug, "no_file_for_task_label", cls, str(cls))
+            else:
+                _copy_row(chosen, base, 4, "Pancreas", slug, rows, cls, str(cls))
+    else:
+        for cls in (0, 1):
+            _append_missing(rows, 4, "Pancreas", f"pancreas_bin_{cls}", "missing_root", cls, str(cls))
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(base, "dashboard_labels.csv")
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+    readme = os.path.join(base, "README_DASHBOARD_SAMPLES.txt")
+    with open(readme, "w", encoding="utf-8") as f:
+        f.write(
+            "Export por etiqueta de tarea (hasta 31 filas). Ver dashboard_labels.csv. "
+            "Archivos sin preprocesar (shutil.copy2).\n"
+        )
+    print(f"OK: {len(df)} filas -> {csv_path}")
+    print(f"Carpeta: {os.path.abspath(base)}")
+    return csv_path, df
+
+
+export_dashboard_raw_samples = export_dashboard_raw_samples_by_task_label
+
+
+
+--- CELL 10 ---
+# ZIP + descarga (Colab): una muestra por etiqueta de tarea + dashboard_labels.csv
+# Requiere: celda anterior con export_dashboard_raw_samples_by_task_label
+#           y celda con build_dataset_label_index / NIH_CLASSES_14 / ISIC_CLASSES_8.
+
+DASHBOARD_RAW_EXPORT_DIR = os.path.join(LOCAL_DEST, "dashboard_raw_samples")
+ZIP_BASE = os.path.join(LOCAL_DEST, "dashboard_raw_samples_export")
+
+_label_idx = build_dataset_label_index(DATASET_ROOTS)
+csv_path, df = export_dashboard_raw_samples_by_task_label(
+    out_dir=DASHBOARD_RAW_EXPORT_DIR,
+    label_index=_label_idx,
+)
+
+try:
+    from IPython.display import display
+    display(df)
+except Exception:
+    print(df.to_string())
+
+zip_path = shutil.make_archive(ZIP_BASE, "zip", DASHBOARD_RAW_EXPORT_DIR)
+print(f"ZIP: {zip_path}")
+
+try:
+    from google.colab import files
+    print("Descargando ZIP y CSV…")
+    files.download(zip_path)
+    files.download(csv_path)
+except ImportError:
+    print("Fuera de Colab:")
+    print(" ", zip_path)
+    print(" ", csv_path)
+
+
+
+--- CELL 11 ---
+from monai.networks.blocks import PatchEmbed
+import torch
+import torch.nn as nn
+
+class SwitchablePatchEmbed(nn.Module):
+    """
+    Switchable Patch Embedding (SPE) — Pasos D→I.
+    Versión corregida y más robusta.
+    """
+    def __init__(self, embed_dim=192, patch_size_2d=16, patch_size_3d=8, in_channels_2d=3):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        # D: Patch Embedding 2D
+        self.patch_embed_2d = PatchEmbed(
+            spatial_dims=2,
+            in_chans=in_channels_2d,      # ← Correcto: in_chans
+            patch_size=patch_size_2d,
+            embed_dim=embed_dim           # ← Correcto: embed_dim
+        )
+
+        # E: Patch Embedding 3D
+        self.patch_embed_3d = PatchEmbed(
+            spatial_dims=3,
+            in_chans=1,
+            patch_size=patch_size_3d,
+            embed_dim=embed_dim
+        )
+
+        # 1 (CLS) + max(14*14, 8**3) = 1 + 512 = 513 tokens
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, 513, embed_dim))
+
+    def _patch_tokens_to_sequence(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+        """MONAI puede devolver [B,N,D] o tensores espaciales [B,H',W',D] / [B,D,H',W']."""
+        x = patch_tokens
+        if x.dim() == 3 and x.size(-1) == self.embed_dim:
+            return x.squeeze(0) if x.size(0) == 1 else x.reshape(-1, self.embed_dim)
+        if x.dim() >= 3 and x.size(-1) == self.embed_dim:
+            return x.reshape(-1, self.embed_dim)
+        if x.dim() == 4 and x.size(1) == self.embed_dim:
+            x = x.flatten(2).transpose(1, 2).contiguous()
+            return x.reshape(-1, self.embed_dim)
+        if x.dim() == 5 and x.size(1) == self.embed_dim:
+            x = x.flatten(2).transpose(1, 2).contiguous()
+            return x.reshape(-1, self.embed_dim)
+        raise RuntimeError(f'Forma de patch tokens no soportada: {tuple(patch_tokens.shape)}')
+
+    def forward(self, batch_tensors):
+        batch_size = len(batch_tensors)
+        tokens_list = []
+
+        for sample in batch_tensors:
+            sample = sample.unsqueeze(0)  # [1, C, ...]
+
+            if sample.ndim == 4:
+                if sample.shape[1] == 1:
+                    sample = sample.repeat(1, 3, 1, 1)
+                patch_tokens = self.patch_embed_2d(sample)
+            elif sample.ndim == 5:
+                patch_tokens = self.patch_embed_3d(sample)
+            else:
+                raise ValueError(f'Tensor de entrada inválido (ndim={sample.ndim}): {tuple(sample.shape)}')
+
+            seq = self._patch_tokens_to_sequence(patch_tokens)
+            tokens_list.append(seq)
+
+        # H: Padding
+        padded = torch.nn.utils.rnn.pad_sequence(tokens_list, batch_first=True)
+
+        # Máscara (True = válido)
+        lengths = torch.tensor([t.size(0) for t in tokens_list], device=padded.device)
+        max_len = padded.size(1)
+        mask = torch.arange(max_len, device=padded.device)[None, :] < lengths[:, None]
+
+        # I: CLS + Positional
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        final_tokens = torch.cat((cls_tokens, padded), dim=1)
+
+        cls_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=mask.device)
+        final_mask = torch.cat((cls_mask, mask), dim=1)
+
+        final_tokens = final_tokens + self.pos_embed[:, :final_tokens.size(1), :]
+
+        return final_tokens, final_mask
+
+class VisionRouter(nn.Module):
+    def __init__(self, embed_dim=192, num_experts=5, num_layers=12, pretrained=True):
+        super().__init__()
+
+        self.patch_embed = SwitchablePatchEmbed(embed_dim=embed_dim)
+
+        # Usamos ViT-Tiny de timm (mucho más optimizado)
+        self.vit = timm.create_model(
+            'vit_tiny_patch16_224',
+            pretrained=pretrained,
+            num_classes=0,           # sin cabeza de clasificación
+            global_pool='',          # no pooling
+            img_size=224,            # solo referencia, no lo usamos realmente
+        )
+
+        # Reemplazamos el patch_embed original de timm por nuestro Switchable
+        self.vit.patch_embed = nn.Identity()
+
+        # Si queremos controlar el número de layers (opcional)
+        if num_layers < 12:
+            self.vit.blocks = self.vit.blocks[:num_layers]
+
+        # Cabeza del router
+        self.router_head = nn.Linear(embed_dim, num_experts)
+
+    def forward(self, batch_tensors):
+        # A → I: Patch + CLS + Positional
+        x, mask = self.patch_embed(batch_tensors)   # [B, seq_len+1, 192]
+
+        # timm ViT espera entrada sin CLS token + positional ya incluido
+        # Como nosotros ya agregamos CLS y positional, pasamos directamente
+
+        # Opción más limpia: forward manual solo de los bloques
+        for blk in self.vit.blocks:
+            x = blk(x)
+
+        # K/L: Extraer CLS token (posición 0)
+        cls_token = x[:, 0]                    # [B, 192]
+
+        # M: Router head
+        logits = self.router_head(cls_token)   # [B, 5]
+
+        return logits, cls_token
+
+print('VisionRouter definido (Pasos J→M).')
+
+
+--- CELL 12 ---
+# --- Fase 19: entrenamiento del router con métricas completas ---
+
+import math
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _switch_aux_loss(router_probs: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """L_aux = N * sum_i f_i * P_i (Switch Transformer)."""
+    B = router_probs.size(0)
+    if B == 0:
+        return router_probs.sum() * 0.0
+    hard = router_probs.argmax(dim=1)
+    with torch.no_grad():
+        f = torch.bincount(hard, minlength=num_experts).float() / float(B)
+    P = router_probs.mean(dim=0)
+    return num_experts * (f * P).sum()
+
+
+def _routing_ratio_from_preds(preds: torch.Tensor, num_experts: int = 5) -> float:
+    f = torch.bincount(preds, minlength=num_experts).float()
+    frac = f / (f.sum() + 1e-9)
+    return float(frac.max().item() / (frac.min().item() + 1e-9))
+
+
+def _entropy_mean(probs: torch.Tensor) -> float:
+    ent = -(probs * (probs.clamp_min(1e-9).log())).sum(dim=1)
+    return float(ent.mean().item())
+
+
+def _confusion_matrix(preds: torch.Tensor, targets: torch.Tensor, n_classes: int = 5) -> torch.Tensor:
+    cm = torch.zeros((n_classes, n_classes), dtype=torch.long)
+    for t, p in zip(targets.view(-1), preds.view(-1)):
+        cm[t.long(), p.long()] += 1
+    return cm
+
+
+def set_train_router_mode(model: VisionRouter, mode: str = 'head_only', unfreeze_last_blocks: int = 2):
+    """
+    mode=head_only: entrena solo router_head.
+    mode=partial_unfreeze: entrena router_head + últimos bloques del ViT.
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+
+    for p in model.router_head.parameters():
+        p.requires_grad = True
+
+    if mode == 'partial_unfreeze':
+        n = len(model.vit.blocks)
+        start = max(0, n - int(unfreeze_last_blocks))
+        for bi in range(start, n):
+            for p in model.vit.blocks[bi].parameters():
+                p.requires_grad = True
+
+
+def build_optimizer_for_mode(model: VisionRouter, mode: str, lr_router: float, lr_vit: float):
+    if mode == 'head_only':
+        params = [p for p in model.router_head.parameters() if p.requires_grad]
+        return torch.optim.AdamW(params, lr=lr_router, weight_decay=1e-4)
+
+    router_params = [p for p in model.router_head.parameters() if p.requires_grad]
+    vit_params = [p for n, p in model.named_parameters() if p.requires_grad and 'router_head' not in n]
+    return torch.optim.AdamW(
+        [
+            {'params': router_params, 'lr': lr_router},
+            {'params': vit_params, 'lr': lr_vit},
+        ],
+        weight_decay=1e-4,
+    )
+
+
+# Dataset IDs que usan etiqueta de tarea single-label (puede usarse CE directamente).
+# NIH (0) es multi-label con espacio distinto al experto; se omite L_task para ese dominio.
+_SINGLE_LABEL_DATASETS = {1, 2, 3, 4}  # ISIC, Osteo, LUNA16, Pancreas
+
+
+def train_router_one_epoch(
+    model: VisionRouter,
+    dataloader,
+    optimizer,
+    device,
+    *,
+    alpha_aux: float = 0.05,
+    label_smoothing: float = 0.0,
+    scaler=None,
+    max_batches: int | None = None,
+    experts: dict | None = None,
+):
+    """
+    Entrena el router una época.
+
+    Flujo base (experts=None):
+      L = CE(router_logits, expert_ids) + alpha_aux * L_aux
+
+    Flujo profesor (experts dict proporcionado + dataloader con task labels):
+      1. Router → gating probs → Top-1 expert elegido.
+      2. Forward del experto (frozen, sin grad en pesos del experto).
+      3. Logits_experto × gating_score → L_task (CE por muestra; crea gradiente
+         hacia el router a través de gating_score).
+      4. L = L_routing + L_task + alpha_aux * L_aux
+         (expertos: requires_grad=False; router+cabeza: sí).
+    """
+    model.train()
+    routing_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    task_criterion = nn.CrossEntropyLoss()
+
+    total_loss = 0.0
+    total_ce = 0.0
+    total_aux = 0.0
+    n_samples = 0
+    n_correct = 0
+
+    all_preds = []
+    all_targets = []
+    all_entropy = []
+
+    use_amp = scaler is not None and str(device).startswith('cuda')
+
+    for bi, batch in enumerate(dataloader):
+        if max_batches is not None and bi >= max_batches:
+            break
+
+        # Soporte batch con y sin etiquetas de tarea (2 vs 4 elementos)
+        if len(batch) == 4:
+            tensors, expert_ids, task_labels_raw, _ = batch
+        else:
+            tensors, expert_ids = batch
+            task_labels_raw = None
+
+        tensors = [t.to(device, non_blocking=True) for t in tensors]
+        expert_ids = expert_ids.to(device, non_blocking=True).long()
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            logits_router, _ = model(tensors)
+            probs = F.softmax(logits_router, dim=1)  # [B, 5]
+
+            # --- L_routing: supervisión de enrutamiento (CE vs dataset de origen) ---
+            L_routing = routing_criterion(logits_router, expert_ids)
+
+            # --- Flujo del profesor: experto forward + L_task ---
+            L_task = None
+            if experts is not None and task_labels_raw is not None:
+                pred_expert_ids = probs.argmax(dim=1)  # top-1 del router (0-4)
+                task_parts = []
+                for eid_val in pred_expert_ids.unique().tolist():
+                    eid_val = int(eid_val)
+                    if eid_val not in _SINGLE_LABEL_DATASETS:
+                        continue  # NIH multi-label: CE incompatible con L_task actual
+                    expert_key = eid_val + 1  # dataset_id 0-4 → EXPERT_SPECS 1-5
+                    if expert_key not in experts:
+                        continue
+                    mask = pred_expert_ids == eid_val
+                    all_assigned_idxs = mask.nonzero(as_tuple=False).view(-1).tolist()
+                    # Homogeneidad: solo muestras cuyo dataset de origen coincide con el experto elegido
+                    # (misma modalidad/forma tensorial; evita mezclar 2D y 3D en torch.stack)
+                    valid_idxs = []
+                    for i in all_assigned_idxs:
+                        if int(expert_ids[i].item()) != eid_val:
+                            continue
+                        tlr = task_labels_raw[i]
+                        if tlr is None:
+                            continue
+                        if isinstance(tlr, np.ndarray) and tlr.size != 1:
+                            continue
+                        if isinstance(tlr, torch.Tensor) and tlr.numel() != 1:
+                            continue
+                        valid_idxs.append(i)
+                    if not valid_idxs:
+                        continue
+                    tl_list = []
+                    for i in valid_idxs:
+                        tlr = task_labels_raw[i]
+                        if isinstance(tlr, torch.Tensor):
+                            tl_list.append(int(tlr.detach().cpu().item()))
+                        elif isinstance(tlr, np.ndarray):
+                            tl_list.append(int(np.asarray(tlr).reshape(-1)[0]))
+                        else:
+                            tl_list.append(int(tlr))
+                    if len(tl_list) != len(valid_idxs):
+                        continue
+                    tl_sub = torch.tensor(tl_list, dtype=torch.long, device=device)
+                    try:
+                        x_sub = torch.stack([tensors[i] for i in valid_idxs])
+                        with torch.no_grad():
+                            expert_logits = experts[expert_key](x_sub)
+                        g_scores = probs[
+                            torch.tensor(valid_idxs, device=device), eid_val
+                        ].unsqueeze(1)
+                        weighted = expert_logits * g_scores
+                        L_task_i = task_criterion(weighted, tl_sub)
+                        task_parts.append(L_task_i)
+                    except Exception as e:
+                        continue
+                if task_parts:
+                    L_task = sum(task_parts) / len(task_parts)
+
+            aux = _switch_aux_loss(probs, model.router_head.out_features)
+            # Diagrama del profesor:
+            #   Con expertos → L = L_task + α·L_aux  (el router aprende del diagnóstico real)
+            #   Sin expertos / fallback (ej. NIH multi-label sin L_task) → L = L_routing + α·L_aux
+            if L_task is not None:
+                loss = L_task + alpha_aux * aux
+            else:
+                loss = L_routing + alpha_aux * aux
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        preds = logits_router.argmax(dim=1)
+        bs = expert_ids.size(0)
+        total_loss += loss.item() * bs
+        total_ce += L_routing.item() * bs
+        total_aux += aux.item() * bs
+        n_samples += bs
+        n_correct += (preds == expert_ids).sum().item()
+
+        all_preds.append(preds.detach().cpu())
+        all_targets.append(expert_ids.detach().cpu())
+        all_entropy.append((-(probs * probs.clamp_min(1e-9).log()).sum(dim=1)).detach().cpu())
+
+    if n_samples == 0:
+        return {'loss': 0.0, 'ce': 0.0, 'aux': 0.0, 'routing_acc': 0.0, 'ratio': 999.0, 'entropy': 0.0, 'cm': torch.zeros((5, 5), dtype=torch.long), 'n': 0}
+
+    preds_all = torch.cat(all_preds)
+    targets_all = torch.cat(all_targets)
+    ratio = _routing_ratio_from_preds(preds_all, num_experts=model.router_head.out_features)
+    entropy = float(torch.cat(all_entropy).mean().item())
+    cm = _confusion_matrix(preds_all, targets_all, n_classes=model.router_head.out_features)
+
+    return {
+        'loss': total_loss / n_samples,
+        'ce': total_ce / n_samples,
+        'aux': total_aux / n_samples,
+        'routing_acc': n_correct / n_samples,
+        'ratio': ratio,
+        'entropy': entropy,
+        'cm': cm,
+        'n': n_samples,
+    }
+
+
+def eval_router_on_cls(router_head: nn.Module, Z_val_np: np.ndarray, y_val_np: np.ndarray, device: str = 'cpu'):
+    router_head.eval()
+    Z_t = torch.tensor(Z_val_np, dtype=torch.float32, device=device)
+    y_t = torch.tensor(y_val_np, dtype=torch.long, device=device)
+    with torch.no_grad():
+        logits = router_head(Z_t)
+        probs = F.softmax(logits, dim=1)
+        preds = logits.argmax(dim=1)
+        acc = (preds == y_t).float().mean().item()
+    ratio = _routing_ratio_from_preds(preds.detach().cpu(), num_experts=probs.shape[1])
+    entropy = _entropy_mean(probs.detach().cpu())
+    cm = _confusion_matrix(preds.detach().cpu(), y_t.detach().cpu(), n_classes=probs.shape[1])
+    return {'val_acc': float(acc), 'val_ratio': float(ratio), 'val_entropy': float(entropy), 'val_cm': cm}
+
+
+def _save_router_ckpt(model, ckpt_path, mode, alpha_aux, history, best_meta, ep):
+    """Guarda checkpoint completo del router (cabeza + ViT backbone)."""
+    os.makedirs(os.path.dirname(ckpt_path) or '.', exist_ok=True)
+    torch.save(
+        {
+            'model_state_dict': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            'router_head': {k: v.detach().cpu() for k, v in model.router_head.state_dict().items()},
+            'best_epoch': ep,
+            'best_meta': best_meta,
+            'mode': mode,
+            'alpha_aux': alpha_aux,
+            'history': [{k: v for k, v in h.items() if k not in ('train_cm', 'val_cm')} for h in history],
+        },
+        ckpt_path,
+    )
+
+
+def fit_router_with_eval(
+    model: VisionRouter,
+    dataloader,
+    Z_val_np: np.ndarray,
+    y_val_np: np.ndarray,
+    device: str,
+    *,
+    mode: str = 'head_only',
+    epochs: int = 10,
+    alpha_aux: float = 0.01,
+    lr_router: float = 1e-3,
+    lr_vit: float = 3e-5,
+    label_smoothing: float = 0.1,
+    unfreeze_last_blocks: int = 2,
+    max_batches_per_epoch: int | None = None,
+    ckpt_path: str | None = None,
+    experts: dict | None = None,
+):
+    """
+    Entrena el router con evaluación por época.
+
+    experts: dict {expert_key: nn.Module} — si se proporciona, activa el flujo del
+      profesor (forward del experto elegido + L_task). El dataloader debe haber sido
+      construido con include_task_label=True para que los batches incluyan etiquetas de
+      tarea. Sin experts, el entrenamiento usa solo L_routing + L_aux (flujo base).
+
+    Guarda el mejor checkpoint en disco cada vez que val_score mejora (no solo al final).
+    """
+    set_train_router_mode(model, mode=mode, unfreeze_last_blocks=unfreeze_last_blocks)
+    model.to(device)
+    _dev_real = next(model.parameters()).device
+    print(f"[fit_router_with_eval] pesos del router en: {_dev_real} (objetivo: {device})")
+    if str(_dev_real) == 'cpu' and torch.cuda.is_available():
+        print(
+            "  AVISO: el modelo quedó en CPU aunque hay GPU. "
+            "Pasa device='cuda' o torch.device('cuda') explícitamente."
+        )
+    if experts is not None:
+        print(f"  Flujo del profesor activo: {len(experts)} expertos en forward de entrenamiento.")
+
+    optimizer = build_optimizer_for_mode(model, mode=mode, lr_router=lr_router, lr_vit=lr_vit)
+    use_cuda = str(device).startswith('cuda') and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1), eta_min=1e-5)
+
+    history = []
+    best_score = -1e9
+    best_state = None
+
+    for ep in range(1, epochs + 1):
+        train_m = train_router_one_epoch(
+            model, dataloader, optimizer, device,
+            alpha_aux=alpha_aux,
+            label_smoothing=label_smoothing,
+            scaler=scaler if use_cuda else None,
+            max_batches=max_batches_per_epoch,
+            experts=experts,
+        )
+        val_m = eval_router_on_cls(model.router_head, Z_val_np, y_val_np, device=device)
+        scheduler.step()
+
+        vram_mb = 0.0
+        if use_cuda:
+            vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            torch.cuda.reset_peak_memory_stats()
+
+        combined = {
+            'epoch': ep,
+            'mode': mode,
+            'alpha_aux': alpha_aux,
+            'lr_router': optimizer.param_groups[0]['lr'],
+            'train_loss': train_m['loss'],
+            'train_ce': train_m['ce'],
+            'train_aux': train_m['aux'],
+            'train_acc': train_m['routing_acc'],
+            'train_ratio': train_m['ratio'],
+            'train_entropy': train_m['entropy'],
+            'val_acc': val_m['val_acc'],
+            'val_ratio': val_m['val_ratio'],
+            'val_entropy': val_m['val_entropy'],
+            'vram_mb': vram_mb,
+            'train_cm': train_m['cm'],
+            'val_cm': val_m['val_cm'],
+        }
+        history.append(combined)
+
+        print(
+            f"[{mode}] Ep {ep}/{epochs}  "
+            f"train_acc={combined['train_acc']:.4f} val_acc={combined['val_acc']:.4f}  "
+            f"ratio={combined['val_ratio']:.3f} ent={combined['val_entropy']:.3f}  "
+            f"aux={combined['train_aux']:.4f} vram_mb={combined['vram_mb']:.1f}"
+        )
+
+        # Prioriza val_acc y penaliza desbalance >1.30
+        score = combined['val_acc'] - 0.02 * max(0.0, combined['val_ratio'] - 1.30)
+        if score > best_score:
+            best_score = score
+            best_state = {
+                'router_head': {k: v.detach().cpu() for k, v in model.router_head.state_dict().items()},
+                'meta': combined,
+            }
+            # Guardar mejor checkpoint en disco en cuanto mejora (no solo al final)
+            if ckpt_path:
+                _save_router_ckpt(model, ckpt_path, mode, alpha_aux, history, combined, ep)
+                print(f"  → mejor ckpt guardado ep {ep} (score={score:.4f}): {ckpt_path}")
+
+    # Restaurar los mejores pesos al modelo en memoria
+    if best_state is not None:
+        model.router_head.load_state_dict(best_state['router_head'])
+
+    return model, history
+
+
+print('Funciones de entrenamiento listas: fit_router_with_eval + métricas de gating/balance/confusión.')
+
+
+--- CELL 13 ---
+# --- MoE: todos los expertos fijados en VRAM (rápido; sin CPU↔GPU por batch) ---
+# Carga los 5 modelos una vez en el mismo device. Requiere VRAM suficiente; si falla OOM, reduce batch o usa CPU.
+
+import warnings
+
+
+def _resolve_moe_device(device=None):
+    if device is not None:
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    warnings.warn("CUDA no disponible: expertos permanecerán en CPU.")
+    return torch.device("cpu")
+
+
+def _vram_gib() -> float | None:
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.memory_allocated() / (1024 ** 3)
+
+
+class ExpertsPinnedGPU:
+    """
+    Todos los expertos residen en `device` (idealmente CUDA) desde el inicio.
+    `get(eid)` solo indexa en memoria — sin eviction ni `.to()` por muestra.
+    """
+
+    def __init__(self, expert_models: dict, device=None, *, verbose: bool = True):
+        self.device = _resolve_moe_device(device)
+        self.experts: dict[int, torch.nn.Module] = {}
+        before = _vram_gib()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            before = _vram_gib()
+
+        for eid, model in sorted(expert_models.items(), key=lambda kv: int(kv[0])):
+            eid = int(eid)
+            try:
+                model = model.to(self.device).eval()
+            except RuntimeError as err:
+                if "out of memory" in str(err).lower() and self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    raise RuntimeError(
+                        "OOM al subir expertos a GPU. Prueba: reduce batch en inferencia, "
+                        "cierra otros procesos en la GPU, o ExpertsPinnedGPU(..., device='cpu')."
+                    ) from err
+                raise
+            for p in model.parameters():
+                p.requires_grad = False
+            self.experts[eid] = model
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        after = _vram_gib()
+        if verbose:
+            if after is not None and before is not None:
+                print(
+                    f"ExpertsPinnedGPU: {len(self.experts)} modelos en {self.device} | "
+                    f"VRAM delta ~{after - before:.2f} GiB (aprox., solo expertos)"
+                )
+            else:
+                print(f"ExpertsPinnedGPU: {len(self.experts)} modelos en {self.device}")
+
+    def get(self, expert_id: int) -> torch.nn.Module:
+        return self.experts[int(expert_id)]
+
+print("ExpertsPinnedGPU listo.")
+

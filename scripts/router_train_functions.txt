@@ -1,0 +1,403 @@
+
+--- CELL 12 ---
+# --- Fase 19: entrenamiento del router con métricas completas ---
+
+import math
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _switch_aux_loss(router_probs: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """L_aux = N * sum_i f_i * P_i (Switch Transformer)."""
+    B = router_probs.size(0)
+    if B == 0:
+        return router_probs.sum() * 0.0
+    hard = router_probs.argmax(dim=1)
+    with torch.no_grad():
+        f = torch.bincount(hard, minlength=num_experts).float() / float(B)
+    P = router_probs.mean(dim=0)
+    return num_experts * (f * P).sum()
+
+
+def _routing_ratio_from_preds(preds: torch.Tensor, num_experts: int = 5) -> float:
+    f = torch.bincount(preds, minlength=num_experts).float()
+    frac = f / (f.sum() + 1e-9)
+    return float(frac.max().item() / (frac.min().item() + 1e-9))
+
+
+def _entropy_mean(probs: torch.Tensor) -> float:
+    ent = -(probs * (probs.clamp_min(1e-9).log())).sum(dim=1)
+    return float(ent.mean().item())
+
+
+def _confusion_matrix(preds: torch.Tensor, targets: torch.Tensor, n_classes: int = 5) -> torch.Tensor:
+    cm = torch.zeros((n_classes, n_classes), dtype=torch.long)
+    for t, p in zip(targets.view(-1), preds.view(-1)):
+        cm[t.long(), p.long()] += 1
+    return cm
+
+
+def set_train_router_mode(model: VisionRouter, mode: str = 'head_only', unfreeze_last_blocks: int = 2):
+    """
+    mode=head_only: entrena solo router_head.
+    mode=partial_unfreeze: entrena router_head + últimos bloques del ViT.
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+
+    for p in model.router_head.parameters():
+        p.requires_grad = True
+
+    if mode == 'partial_unfreeze':
+        n = len(model.vit.blocks)
+        start = max(0, n - int(unfreeze_last_blocks))
+        for bi in range(start, n):
+            for p in model.vit.blocks[bi].parameters():
+                p.requires_grad = True
+
+
+def build_optimizer_for_mode(model: VisionRouter, mode: str, lr_router: float, lr_vit: float):
+    if mode == 'head_only':
+        params = [p for p in model.router_head.parameters() if p.requires_grad]
+        return torch.optim.AdamW(params, lr=lr_router, weight_decay=1e-4)
+
+    router_params = [p for p in model.router_head.parameters() if p.requires_grad]
+    vit_params = [p for n, p in model.named_parameters() if p.requires_grad and 'router_head' not in n]
+    return torch.optim.AdamW(
+        [
+            {'params': router_params, 'lr': lr_router},
+            {'params': vit_params, 'lr': lr_vit},
+        ],
+        weight_decay=1e-4,
+    )
+
+
+# Dataset IDs que usan etiqueta de tarea single-label (puede usarse CE directamente).
+# NIH (0) es multi-label con espacio distinto al experto; se omite L_task para ese dominio.
+_SINGLE_LABEL_DATASETS = {1, 2, 3, 4}  # ISIC, Osteo, LUNA16, Pancreas
+
+
+def train_router_one_epoch(
+    model: VisionRouter,
+    dataloader,
+    optimizer,
+    device,
+    *,
+    alpha_aux: float = 0.05,
+    label_smoothing: float = 0.0,
+    scaler=None,
+    max_batches: int | None = None,
+    experts: dict | None = None,
+):
+    """
+    Entrena el router una época.
+
+    Flujo base (experts=None):
+      L = CE(router_logits, expert_ids) + alpha_aux * L_aux
+
+    Flujo profesor (experts dict proporcionado + dataloader con task labels):
+      1. Router → gating probs → Top-1 expert elegido.
+      2. Forward del experto (frozen, sin grad en pesos del experto).
+      3. Logits_experto × gating_score → L_task (CE por muestra; crea gradiente
+         hacia el router a través de gating_score).
+      4. L = L_routing + L_task + alpha_aux * L_aux
+         (expertos: requires_grad=False; router+cabeza: sí).
+    """
+    model.train()
+    routing_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    task_criterion = nn.CrossEntropyLoss()
+
+    total_loss = 0.0
+    total_ce = 0.0
+    total_aux = 0.0
+    n_samples = 0
+    n_correct = 0
+
+    all_preds = []
+    all_targets = []
+    all_entropy = []
+
+    use_amp = scaler is not None and str(device).startswith('cuda')
+
+    for bi, batch in enumerate(dataloader):
+        if max_batches is not None and bi >= max_batches:
+            break
+
+        # Soporte batch con y sin etiquetas de tarea (2 vs 4 elementos)
+        if len(batch) == 4:
+            tensors, expert_ids, task_labels_raw, _ = batch
+        else:
+            tensors, expert_ids = batch
+            task_labels_raw = None
+
+        tensors = [t.to(device, non_blocking=True) for t in tensors]
+        expert_ids = expert_ids.to(device, non_blocking=True).long()
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            logits_router, _ = model(tensors)
+            probs = F.softmax(logits_router, dim=1)  # [B, 5]
+
+            # --- L_routing: supervisión de enrutamiento (CE vs dataset de origen) ---
+            L_routing = routing_criterion(logits_router, expert_ids)
+
+            # --- Flujo del profesor: experto forward + L_task ---
+            L_task = None
+            if experts is not None and task_labels_raw is not None:
+                pred_expert_ids = probs.argmax(dim=1)  # top-1 del router (0-4)
+                task_parts = []
+                for eid_val in pred_expert_ids.unique().tolist():
+                    eid_val = int(eid_val)
+                    if eid_val not in _SINGLE_LABEL_DATASETS:
+                        continue  # NIH multi-label: CE incompatible con L_task actual
+                    expert_key = eid_val + 1  # dataset_id 0-4 → EXPERT_SPECS 1-5
+                    if expert_key not in experts:
+                        continue
+                    mask = pred_expert_ids == eid_val
+                    all_assigned_idxs = mask.nonzero(as_tuple=False).view(-1).tolist()
+                    # Homogeneidad: solo muestras cuyo dataset de origen coincide con el experto elegido
+                    # (misma modalidad/forma tensorial; evita mezclar 2D y 3D en torch.stack)
+                    valid_idxs = []
+                    for i in all_assigned_idxs:
+                        if int(expert_ids[i].item()) != eid_val:
+                            continue
+                        tlr = task_labels_raw[i]
+                        if tlr is None:
+                            continue
+                        if isinstance(tlr, np.ndarray) and tlr.size != 1:
+                            continue
+                        if isinstance(tlr, torch.Tensor) and tlr.numel() != 1:
+                            continue
+                        valid_idxs.append(i)
+                    if not valid_idxs:
+                        continue
+                    tl_list = []
+                    for i in valid_idxs:
+                        tlr = task_labels_raw[i]
+                        if isinstance(tlr, torch.Tensor):
+                            tl_list.append(int(tlr.detach().cpu().item()))
+                        elif isinstance(tlr, np.ndarray):
+                            tl_list.append(int(np.asarray(tlr).reshape(-1)[0]))
+                        else:
+                            tl_list.append(int(tlr))
+                    if len(tl_list) != len(valid_idxs):
+                        continue
+                    tl_sub = torch.tensor(tl_list, dtype=torch.long, device=device)
+                    try:
+                        x_sub = torch.stack([tensors[i] for i in valid_idxs])
+                        with torch.no_grad():
+                            expert_logits = experts[expert_key](x_sub)
+                        g_scores = probs[
+                            torch.tensor(valid_idxs, device=device), eid_val
+                        ].unsqueeze(1)
+                        weighted = expert_logits * g_scores
+                        L_task_i = task_criterion(weighted, tl_sub)
+                        task_parts.append(L_task_i)
+                    except Exception as e:
+                        continue
+                if task_parts:
+                    L_task = sum(task_parts) / len(task_parts)
+
+            aux = _switch_aux_loss(probs, model.router_head.out_features)
+            # Diagrama del profesor:
+            #   Con expertos → L = L_task + α·L_aux  (el router aprende del diagnóstico real)
+            #   Sin expertos / fallback (ej. NIH multi-label sin L_task) → L = L_routing + α·L_aux
+            if L_task is not None:
+                loss = L_task + alpha_aux * aux
+            else:
+                loss = L_routing + alpha_aux * aux
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        preds = logits_router.argmax(dim=1)
+        bs = expert_ids.size(0)
+        total_loss += loss.item() * bs
+        total_ce += L_routing.item() * bs
+        total_aux += aux.item() * bs
+        n_samples += bs
+        n_correct += (preds == expert_ids).sum().item()
+
+        all_preds.append(preds.detach().cpu())
+        all_targets.append(expert_ids.detach().cpu())
+        all_entropy.append((-(probs * probs.clamp_min(1e-9).log()).sum(dim=1)).detach().cpu())
+
+    if n_samples == 0:
+        return {'loss': 0.0, 'ce': 0.0, 'aux': 0.0, 'routing_acc': 0.0, 'ratio': 999.0, 'entropy': 0.0, 'cm': torch.zeros((5, 5), dtype=torch.long), 'n': 0}
+
+    preds_all = torch.cat(all_preds)
+    targets_all = torch.cat(all_targets)
+    ratio = _routing_ratio_from_preds(preds_all, num_experts=model.router_head.out_features)
+    entropy = float(torch.cat(all_entropy).mean().item())
+    cm = _confusion_matrix(preds_all, targets_all, n_classes=model.router_head.out_features)
+
+    return {
+        'loss': total_loss / n_samples,
+        'ce': total_ce / n_samples,
+        'aux': total_aux / n_samples,
+        'routing_acc': n_correct / n_samples,
+        'ratio': ratio,
+        'entropy': entropy,
+        'cm': cm,
+        'n': n_samples,
+    }
+
+
+def eval_router_on_cls(router_head: nn.Module, Z_val_np: np.ndarray, y_val_np: np.ndarray, device: str = 'cpu'):
+    router_head.eval()
+    Z_t = torch.tensor(Z_val_np, dtype=torch.float32, device=device)
+    y_t = torch.tensor(y_val_np, dtype=torch.long, device=device)
+    with torch.no_grad():
+        logits = router_head(Z_t)
+        probs = F.softmax(logits, dim=1)
+        preds = logits.argmax(dim=1)
+        acc = (preds == y_t).float().mean().item()
+    ratio = _routing_ratio_from_preds(preds.detach().cpu(), num_experts=probs.shape[1])
+    entropy = _entropy_mean(probs.detach().cpu())
+    cm = _confusion_matrix(preds.detach().cpu(), y_t.detach().cpu(), n_classes=probs.shape[1])
+    return {'val_acc': float(acc), 'val_ratio': float(ratio), 'val_entropy': float(entropy), 'val_cm': cm}
+
+
+def _save_router_ckpt(model, ckpt_path, mode, alpha_aux, history, best_meta, ep):
+    """Guarda checkpoint completo del router (cabeza + ViT backbone)."""
+    os.makedirs(os.path.dirname(ckpt_path) or '.', exist_ok=True)
+    torch.save(
+        {
+            'model_state_dict': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            'router_head': {k: v.detach().cpu() for k, v in model.router_head.state_dict().items()},
+            'best_epoch': ep,
+            'best_meta': best_meta,
+            'mode': mode,
+            'alpha_aux': alpha_aux,
+            'history': [{k: v for k, v in h.items() if k not in ('train_cm', 'val_cm')} for h in history],
+        },
+        ckpt_path,
+    )
+
+
+def fit_router_with_eval(
+    model: VisionRouter,
+    dataloader,
+    Z_val_np: np.ndarray,
+    y_val_np: np.ndarray,
+    device: str,
+    *,
+    mode: str = 'head_only',
+    epochs: int = 10,
+    alpha_aux: float = 0.01,
+    lr_router: float = 1e-3,
+    lr_vit: float = 3e-5,
+    label_smoothing: float = 0.1,
+    unfreeze_last_blocks: int = 2,
+    max_batches_per_epoch: int | None = None,
+    ckpt_path: str | None = None,
+    experts: dict | None = None,
+):
+    """
+    Entrena el router con evaluación por época.
+
+    experts: dict {expert_key: nn.Module} — si se proporciona, activa el flujo del
+      profesor (forward del experto elegido + L_task). El dataloader debe haber sido
+      construido con include_task_label=True para que los batches incluyan etiquetas de
+      tarea. Sin experts, el entrenamiento usa solo L_routing + L_aux (flujo base).
+
+    Guarda el mejor checkpoint en disco cada vez que val_score mejora (no solo al final).
+    """
+    set_train_router_mode(model, mode=mode, unfreeze_last_blocks=unfreeze_last_blocks)
+    model.to(device)
+    _dev_real = next(model.parameters()).device
+    print(f"[fit_router_with_eval] pesos del router en: {_dev_real} (objetivo: {device})")
+    if str(_dev_real) == 'cpu' and torch.cuda.is_available():
+        print(
+            "  AVISO: el modelo quedó en CPU aunque hay GPU. "
+            "Pasa device='cuda' o torch.device('cuda') explícitamente."
+        )
+    if experts is not None:
+        print(f"  Flujo del profesor activo: {len(experts)} expertos en forward de entrenamiento.")
+
+    optimizer = build_optimizer_for_mode(model, mode=mode, lr_router=lr_router, lr_vit=lr_vit)
+    use_cuda = str(device).startswith('cuda') and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1), eta_min=1e-5)
+
+    history = []
+    best_score = -1e9
+    best_state = None
+
+    for ep in range(1, epochs + 1):
+        train_m = train_router_one_epoch(
+            model, dataloader, optimizer, device,
+            alpha_aux=alpha_aux,
+            label_smoothing=label_smoothing,
+            scaler=scaler if use_cuda else None,
+            max_batches=max_batches_per_epoch,
+            experts=experts,
+        )
+        val_m = eval_router_on_cls(model.router_head, Z_val_np, y_val_np, device=device)
+        scheduler.step()
+
+        vram_mb = 0.0
+        if use_cuda:
+            vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            torch.cuda.reset_peak_memory_stats()
+
+        combined = {
+            'epoch': ep,
+            'mode': mode,
+            'alpha_aux': alpha_aux,
+            'lr_router': optimizer.param_groups[0]['lr'],
+            'train_loss': train_m['loss'],
+            'train_ce': train_m['ce'],
+            'train_aux': train_m['aux'],
+            'train_acc': train_m['routing_acc'],
+            'train_ratio': train_m['ratio'],
+            'train_entropy': train_m['entropy'],
+            'val_acc': val_m['val_acc'],
+            'val_ratio': val_m['val_ratio'],
+            'val_entropy': val_m['val_entropy'],
+            'vram_mb': vram_mb,
+            'train_cm': train_m['cm'],
+            'val_cm': val_m['val_cm'],
+        }
+        history.append(combined)
+
+        print(
+            f"[{mode}] Ep {ep}/{epochs}  "
+            f"train_acc={combined['train_acc']:.4f} val_acc={combined['val_acc']:.4f}  "
+            f"ratio={combined['val_ratio']:.3f} ent={combined['val_entropy']:.3f}  "
+            f"aux={combined['train_aux']:.4f} vram_mb={combined['vram_mb']:.1f}"
+        )
+
+        # Prioriza val_acc y penaliza desbalance >1.30
+        score = combined['val_acc'] - 0.02 * max(0.0, combined['val_ratio'] - 1.30)
+        if score > best_score:
+            best_score = score
+            best_state = {
+                'router_head': {k: v.detach().cpu() for k, v in model.router_head.state_dict().items()},
+                'meta': combined,
+            }
+            # Guardar mejor checkpoint en disco en cuanto mejora (no solo al final)
+            if ckpt_path:
+                _save_router_ckpt(model, ckpt_path, mode, alpha_aux, history, combined, ep)
+                print(f"  → mejor ckpt guardado ep {ep} (score={score:.4f}): {ckpt_path}")
+
+    # Restaurar los mejores pesos al modelo en memoria
+    if best_state is not None:
+        model.router_head.load_state_dict(best_state['router_head'])
+
+    return model, history
+
+
+print('Funciones de entrenamiento listas: fit_router_with_eval + métricas de gating/balance/confusión.')
+

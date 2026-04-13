@@ -1,0 +1,62 @@
+Total cells: 15
+
+--- CELL 0 (markdown) ---
+  Preview: # Experto 4 — LUNA16: **R3D-18** (video 3D) + Grad-CAM |  | Notebook de entrenamiento del **Experto 4** del sistema MoE. |  | - **Origen de datos:** el zip **`Luna16 Lung Cancer Dataset.zip`** en `01_Data/Raw/` (misma convención que `01_Exploracion_Estructura_Datasets.ipynb`). Tras copiarlo a `/content/data
+  Lines: 12
+
+--- CELL 1 (code) ---
+  Preview: # Fase 0: Setup & montar Drive | !pip install -q SimpleITK nibabel monai scikit-learn tqdm seaborn scipy matplotlib-inline |  | from google.colab import drive | import os, glob, time, json, shutil, subprocess, random | import numpy as np | import pandas as pd | import SimpleITK as sitk | import torch | import torch.n
+  Lines: 61
+
+--- CELL 2 (code) ---
+  Preview: # Fase 1: LUNA16 — mismo flujo que 01_Exploracion_Estructura_Datasets.ipynb | # 1) Copiar el zip desde Drive a /content/datasets/ | # 2) Descomprimir en /content/datasets/Luna16 Lung Cancer Dataset/ | # 3) Borrar el zip local (libera espacio en Colab) | # Los CSV (annotations, candidates_V2, etc.) ya vienen
+  Lines: 67
+
+--- CELL 3 (code) ---
+  Preview: # --- Descubrimiento: ¿dónde está la etiqueta del dataset? (CSV vs .mhd) --- | # Ejecutar después de la Fase 1 (tener LUNA_BASE, mhd_files, csv_files definidos). |  | print("=" * 70) | print("ETIQUETAS LUNA16: ¿en el CSV o en el volumen .mhd?") | print("=" * 70) |  | print(""" | Resumen esperado (challenge LUNA16):
+  Lines: 63
+
+--- CELL 4 (code) ---
+  Preview: # Fase 2: Leer CSVs que ya vienen en el zip (no generamos ningún CSV en disco) | # - annotations.csv: referencia de detección (coords mundo, diámetro) | # - candidates_V2.csv: track FP reduction (class 0 = no-nódulo, 1 = nódulo) | # Etiquetas binarias del challenge (candidatos); no es malignidad LIDC apar
+  Lines: 74
+
+--- CELL 5 (code) ---
+  Preview: # Fase 3: Dataset — volumen COMPLETO → resample 1 mm, HU, [0,1] → trilineal a 64³ | import torch.nn.functional as F |  | VOL_SIZE = (64, 64, 64) | HU_MIN, HU_MAX = -1000.0, 400.0 |  |  | def extract_full_volume_64_np(row): |     """TAC completo: resample isotrópico 1 mm, ventana HU, min-max [0,1], resize trilineal 
+  Lines: 67
+
+--- CELL 6 (code) ---
+  Preview: # Fase 3B: Materializar volúmenes 64³ (volumen completo) en disco + dataset que solo lee .npz |  | VOL_CACHE_DIR = os.path.join(LOCAL_DEST, 'Luna16_fullvol_64_cache_v2') | FORCE_REBUILD_VOL_CACHE = False  # True para regenerar todo el caché |  |  | def materialize_vol_cache(df_labels, cache_dir, force=False): |  
+  Lines: 87
+
+--- CELL 7 (code) ---
+  Preview: # Fase 4: Modelo — **R3D-18** únicamente (Kinetics / video 3D) | from torchvision.models.video import r3d_18, R3D_18_Weights |  |  | class R3D18Expert(nn.Module): |     """ResNet3D-18 binario: 1 canal CT + cabeza lineal.""" |  |     def __init__(self, num_classes=2): |         super().__init__() |         base = r3d_
+  Lines: 37
+
+--- CELL 8 (code) ---
+  Preview: # Fase 5: StratifiedGroupKFold + AMP + dos fases (R3D-18: cabeza → backbone+cabeza) + CE ponderada | # Checkpoints: expert4_{RUN_TAG}_fold{k}_best.pth | historial: history_{RUN_TAG}_fold_{k}.json |  | from sklearn.utils.class_weight import compute_class_weight | from torch.optim.lr_scheduler import Sequenti
+  Lines: 362
+
+--- CELL 9 (code) ---
+  Preview: # Fase 6: Evaluación detallada del mejor fold | if 'RUN_TAG' not in globals(): |     RUN_TAG = 'twophase_wce_v1' |  | best_fold = max(all_fold_metrics, key=lambda m: m['best_val_f1']) | best_fold_idx = best_fold['fold'] | print(f"Mejor fold: {best_fold_idx} (F1={best_fold['best_val_f1']:.4f})") |  | # Cargar modelo
+  Lines: 75
+
+--- CELL 10 (markdown) ---
+  Preview: ### Fase 6B — Curvas de validación y matriz de confusión |  | Ejecutar **después** de la Fase 6. Usa el historial `history_{RUN_TAG}_fold_{mejor_fold}.json` (Fase 5) y la variable `cm` de la evaluación.
+  Lines: 3
+
+--- CELL 11 (code) ---
+  Preview: # Fase 6B: Gráficas — val loss y F1-macro por época (mejor fold) + matriz de confusión | import json | import numpy as np | try: |     __import__("IPython").get_ipython().run_line_magic("matplotlib", "inline") | except Exception: |     pass | import matplotlib.pyplot as plt | from matplotlib.gridspec import GridSpe
+  Lines: 92
+
+--- CELL 12 (code) ---
+  Preview: # Fase 7: Grad-CAM 3D — último bloque convolucional del backbone R3D-18 (antes del pooling global). | # Un ejemplo por clase en validación: mapa en todo el volumen + GIF axial (capa a capa) con la atención superpuesta. | try: |     __import__("IPython").get_ipython().run_line_magic("matplotlib", "inline")
+  Lines: 204
+
+--- CELL 13 (code) ---
+  Preview: # Fase 8: Figuras de entrenamiento (curvas por fold) | if 'RUN_TAG' not in globals(): |     RUN_TAG = 'twophase_wce_v1' |  | import json | import numpy as np | try: |     __import__("IPython").get_ipython().run_line_magic("matplotlib", "inline") | except Exception: |     pass | import matplotlib.pyplot as plt | import se
+  Lines: 70
+
+--- CELL 14 (code) ---
+  Preview: # Fase 9: Resumen final y persistencia | if 'RUN_TAG' not in globals(): |     RUN_TAG = 'twophase_wce_v1' | print("="*60) | print("EXPERTO 4 — LUNA16 SWIN3D — RESUMEN") | print("="*60) | print(f"RUN_TAG (prefijo checkpoints): {RUN_TAG}") |  | print("\nModelo: R3D-18 (R3D18Expert)") | print(f"Parámetros: {n_params:,}"
+  Lines: 36
+
