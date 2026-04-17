@@ -12,3 +12,6 @@ pillow>=10.0
 pandas>=2.0
 scipy>=1.12
 huggingface_hub>=0.20
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
