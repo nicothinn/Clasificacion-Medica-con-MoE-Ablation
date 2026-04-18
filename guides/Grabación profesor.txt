@@ -1,0 +1,115 @@
+(Transcribed by TurboScribe. Go Unlimited to remove this message.)
+
+Lo que se está generando ahí, pero para poderlo ver hay que abrir un poquitico esa caja negra. Mirar a ver que es lo que está, la única forma de medio abrirla, que no podemos teñar full, que lo que está pasando es hacer pruebas controladas. Como una prueba controlada, lo que te digo, tengo unos datos que conozco y sé cuáles deben ser las respuestas.
+
+Entonces, si yo sé cuál es la respuesta y no se cumple, bueno, miremos a ver de los datos controlados cuáles es que está fallando y ya ponemos. Pero yo creo que ya está muy cerca de lo que puedes dejar. Yo te diría que lo que es trabajando.
+
+Vos estás trabajando con Rompa o con que estás trabajando? Yo estoy trabajando. Es que no, yo estoy trabajando con dos pelados que trabajan muy bien, pero como yo también están súper ocupados. Uno va a ser.
+
+Se llama Samuel. Él va a ser ahora dentro de poco. Y de hecho ya estaba en el México.
+
+O sea, yo acá estoy grabando también por eso. Y otro anda como con temas de emprendimiento o algo así, pero. O sea, pues sí, o sea, sí.
+
+Yo estoy como liderando esta vuelta. Se me está diciendo. Si no, que en qué estás, en qué estás, en qué estás procesando esto? O sea, en qué lo están procesando? Qué lo están ejecutando? El entrenamiento con la.
+
+Pasando solamente con Colab. O o. Y le están metiendo con qué? Con T4 o con las. Si, con T4, T4, pero yo utilizo muchos trucos.
+
+Los que usted estaba diciendo los del checkpoint y todas estas cosas. Entonces te miran. Miren todo lo que me utiliza.
+
+800 megas. Ah, no, súper bien. Si a punta de Colab hemos sacado todo, todo, todo.
+
+Y yo le quería preguntar una cosa, porque la IA, pues yo le he preguntado. Pero entonces yo como hago esto del feedback de los expertos cuando yo le cambio la cabeza a la lección estoy porque ellos me dicen que no es retrocompatible porque no hay gradiente. Eso es lo que yo le he entendido.
+
+Hay que entrenarlo desde cero. O sea, son entrenamientos desde cero. Todos son entrenamientos desde cero.
+
+Una ablación directamente es mostrar cuál fue el más eficiente y cuál es el que cumple y por qué cumple. Por qué podría ser mejor la unión transformer, capa lineal, transformer, capa KNN, transformer con los otros métodos estadísticos y determinar cuál es el que funciona mejor, pero toca entrenarlo cada uno. Hacer este proceso que están haciendo, pero con cada uno.
+
+Sí, sí, claro, pero pero mi pregunta bien, Domi, pues es es cómo le van a llegar a los al KNN, a la mixtura gaussiana, cómo le va a llegar la retroalimentación de la retroalimentación, llega el transformer, porque es que la capa, la capa de la capa de enrutamiento toma la toma, la retroalimentación del transformer, porque es una base de transformación. A esa base de transformación es que llega el tensor. Hace de cuenta, acuérdate cómo funciona la arquitectura del transformer.
+
+Si vos tenés, vos tenés una capa de un encoder y un decoder. Sí, sí, sí, claro. Listo.
+
+Entonces, dentro del decoder, si vos ves en la capa del global, del global attention, hay una MLP, que es tu capa lineal, digamos así. Ese MLP lo que está cambiando es por ese sistema, por ese sistema de adhesión. Ok, y ese es el decoder.
+
+Ese es el decodificado. Claro, en el en el decoder, en el decoder hay una, hay una, al final hay una capa lineal, si es, dice capa lineal softmax en la salida. Esa capa lineal es la que no llegue, la corto y pongo ahí un KNN, la corto y pongo ahí un gradiente, perdón, una mistura gaussiana, la corto y pongo un GBN.
+
+Listo. Eso es. Pero tu base, tu arquitectura base, o tu cerebro, digámoslo así, puede llamarse tu cabeza de trabajo, es una, es una arquitectura transformer, que puede ser un BIT, un convolucional BIT, un SWIFT y a ese SWIFT, a la salida de ese SWIFT se corta eso.
+
+¿Qué pasa? Dependiendo de cada uno va a tener que agregar o más bloques o menos bloques, pero yo les decía, vayan, seleccionen uno y hagan el análisis. ¿Cuál sería el mejor? Ya, claro, vale. Entonces.
+
+A ver, a ver, a ver. Input, output, entonces. Esto es lo que nosotros estamos reemplazando, ¿no? Si, espera, tira, yo compro por aquí, está.
+
+Ah, no, output probabilities. Eh, de ahí, exacto, de ahí. Este, este cosito.
+
+Ah. Exacto. No, yo borré de dormir.
+
+¿Listo? Claro. Aquí, cuando está entrando, el sistema se va a retroalimentar aquí en el input embeddings, donde va a estar el tensor con los embeddings normalizados entre D y 3D, ¿no? Sí. Sí.
+
+Sí. Y internamente, dentro del head attention, nosotros tenemos que agregarle ese gatillo, que es el que va a tener una reconstrucción del direccionamiento de la salida de probabilidad respecto a lo que vayan a ver mis sistemas, mis expertos, perdón. Pero la retroalimentación de los gradientes no va a ser directamente a la cabeza de salida o a la capa lineal, sino al transformer.
+
+Y el transformer es el que va a decidir. Y esa capa lineal es la que va a redireccionar según lo que le diga el transformer. ¿Cuál va a servir más? Es lo que hay que ver. 
+
+¿Qué le cambio a eso? Incluso yo podría cambiarle a eso por una, podría cambiarle a eso por una Colmogolop. ¿Sí? No, eso se va a entrenar mañana. Entonces, pero te digo, con cada uno, ya una vez se termina, yo quito esta capa lineal, pam, pam, pam, pam, y meto algún KNN.
+
+Ok. Y pam, pam, pam, quito esto y pongo una mistura gaussiana, pam, pam, pam, un GBM. Y ya la prueba de lablación lo que más indica a mí es.
+
+Bueno, ok. ¿Cuál fue el mejor modelo para obtener esas probabilidades para que mis sistemas redireccionen cada una de esas posibles imágenes a cada uno de los expertos? Ya, ok, ya, ya. Este es lo que yo necesitaba.
+
+Gracias, profesor. No, dale. Porque yo estaba re confundido.
+
+Entonces entraría como por las, o sea, las cabezas de atención. Cogeme eso sí. A cada cabeza te toca cambiarlo, no? Porque si no, te queda una mezcolancia ahí entre lineal, una con GBM, una lineal, ahora otras lineales o tres lineales y o GBM.
+
+Bueno, te toca cambiarlas en todas que esa capa se vuelva barroca. El que más se te va a demorar. Y ahí tienes que mirar cómo haces, cómo juegas con la dimensionalidad de los datos.
+
+Es el del K&N. Ese K&N hay que, tienes que mirar cómo encontrar un punto de equilibrio para encontrar cómo convergerlo de la forma más eficiente. Porque si no, puede ser tedioso.
+
+Creemos datos multidimensionales. Ver de 192, 192 dimensiones. Cómo reestructurarlo para que eso pueda llegar a esa salida dimensional de análisis y interpretabilidad de cómo llevar eso a cada una de las posibles salidas.
+
+Y decirte, mándeme esto allá. Entra de las maneras de probabilidad. En el sistema de disparo, sistema de gatillo, mándeme esto allá.
+
+Eso es lo único. Pero sí, por eso yo estaba preocupado de hace rato. Ustedes no me entendían la preocupación que yo los veía como muy tranquilos.
+
+Chachos, eso se demora en entrenar. Eso se demora. Yo les quité la parte de multimodal, pero igual en imágenes se va a demorar.
+
+Porque eso normalmente no lo hacen en contexto imagen texto. Y eso se demora. O sea, yo nunca me había demorado entrenando algo tanto como esto.
+
+Y eso que yo solamente utilicé un Tiny. Es una versión Tiny de 4K. Ustedes están yendo ahí por 10K y yo... Pucha, esto, man, es como hace.
+
+Están alquilando más que una virgen, ¿o qué? Profe, yo le coloqué tres. También la misma que usted está hablando, Tiny. Entonces por ahí bien.
+
+¿Utilizaste al fin que Swift o VT o Convolution en VT? VT. Ahí lo que está de reproducimiento. Pero ahorita ya ya voy a ver dónde está la espinita, pues.
+
+Vale. Y un consejo así más de eh, gestión del tiempo. Yo creo que cada uno debería ponerse a entrenar una de las, los métodos de ablación, entonces unos que lo traje con la lineal, otro que se ponga a entrenar el del KNN, no lo dejen de último.
+
+Cójalo alguien de primero, porque ese es el que más demora. Ese raco es duro, es duro. Tenga en cuenta usted cómo entrenar como una Super Vector Machine, pero como por 20.
+
+El tiempo de entrenamiento es una cosa dura para que converja. Se da por ahí dos días, cierto? Para lograr un resultado medianamente y considerablemente estable y funcional. Yo te diría que es un poco más que te puede ir incluso todo el fin de semana, porque aquí converja la capa lineal, converge muy rápido.
+
+Sí, porque esa capa lineal densa es rapidito mientras se actualizan las formas. Pero encontrar esos vecinos, esos, esos vecinos cercanos que vayan a ir conglomerándose para cada una de cinco posibles clases. Buscar la, la, buscar esa reducción de dimensionalidad con un PCA que me ayude a visualizar esa alta dimensionalidad y que me la agrupe de una forma, porque también tocaría hacer un preprocesamiento, esos datos para que lleguen más fácil a ese KNN, porque si no, se nos va a quedar con una alta inercia y eso no, no va a haber un punto de separación, van a quedar concentrados primero que todo.
+
+Entonces hay que mirar cómo, cómo, cómo reducir eso. Ese es el que yo diría primero que tenía que haber entrenado, porque eso es una cosa de locos. Eso es un PCA, una reducción de dimensionalidad dentro del embedding, cierto? Sí, directamente a la salida, a la salida de esa, de esa, de esa normalización de la cabeza del decoder.
+
+Y ahí es donde ustedes ya van a tener que meterle otro, una capita de preprocesamiento a eso para que converge más rápido. Yo les diría, saquen una muestra, o sea, como que pongan, pongan un transformer, pongan el transformer y a la salida de un batch cualquiera. Sí, puede ser un batch, puede ser un batch mixto de, de, de, de datos unitarios, es decir, uno por cada clase.
+
+Procesarlo todo y que guarde esa, esos datos multidimensionales dentro de un dato tabular. Y lo sacan aparte y le hacen un preprocesamiento para ver qué pasa. Miren cómo se comportan esos datos.
+
+Y ahí le aplican a ver cómo puede llegar a converger ese KNN. Se podría hacer otra, separarlo y entrarlo por aparte. Después miren a ver si se entrenan juntos, pero que ya venga con un conocimiento básico.
+
+Porque si no, me preocupa. Ese es pesado. Es especial.
+
+Listo, profesor, creo que eso nos va a ayudar mucho. En todas tenemos que llegar a lo mismo, o sea, en las lecciones. El mínimo, exacto, exacto.
+
+Tienen que llegar al mínimo y tienen que mostrar cuál, cuál, cuál sería el mejor. Por qué lo seleccionan? Uno de esos es el rendimiento. Yo creo que lo más fácil va a ser que la línea entre la línea y la gausiana converjan un poco más rápido, pero, pero qué? La cosa es ver qué pueden hacer, cómo hacen ustedes, qué evaluación hacen.
+
+Yo espero ver ustedes qué evaluación hacen de eso y por qué seleccionó ese modelo sobre los otros. Uf, escucha. Eh? Se tiene que llegar en los otros al routine.
+
+A qué hora sigue más de 080 y a? Y al sí, sí, exacto. El punto mínimo es el 080, o sea, para todos, pero ya que tenga el mejor desempeño sobre después de sobre esa métrica. Y todavía ustedes miran que les gusta esa preparación, o sea, pues bueno, este modelo convergen mucho más rápido.
+
+Se logró. Tiene la mejor distribución de carga, lograr distribución de carga en menos tiempo, menos épocas. No me tocó hacerle un fine tune en extra.
+
+Si los tiempos de inferencia en uno, en uno, en los tiempos son de milisegundos sin GPU o en otros son tres segundos sin GPU, con GPU vale son. Es un milisegundo, cosas así. Ustedes hagan un análisis técnico de qué, qué, por qué y cómo llegaron a ese resultado.
+
+Ya entiendo. Vale, listo, claro que sí, por eso. Listo Nicolás, no, pero ya, ya están viendo la luz al final del túnel.
+
+Está muy elaborado. Yo siento no, no es ni por hablar bien ni mal de las cosas, pero es que yo cuando usted mandó eso, yo, yo de una abrí el archivo y lo vi porque yo me fue horrible, me fue como a los perros, yo saqué uno o cinco en la otra.
+
+(Transcribed by TurboScribe. Go Unlimited to remove this message.)
