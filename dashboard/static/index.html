@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MoE Medical Vision Router</title>
+    <!-- Modern Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Icons (Lucide) -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo-box">
+                    <i data-lucide="network"></i>
+                </div>
+                <div>
+                    <h1>MoE Router</h1>
+                    <p>Medical Vision</p>
+                </div>
+            </div>
+
+            <div class="sidebar-content">
+                <div class="section-title">Modo de Operación</div>
+                <div class="toggle-group">
+                    <label class="switch">
+                        <input type="checkbox" id="mock-toggle" checked>
+                        <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label">Modo Demo (Simulado)</span>
+                </div>
+                <div class="info-text">Desactiva para usar modelos de Hugging Face reales.</div>
+
+                <div id="hf-settings" class="hidden">
+                    <div class="input-group">
+                        <label>Repo ID</label>
+                        <input type="text" id="repo-id" value="Lucu1232004p/Proyecto-MoE-Pesos">
+                    </div>
+                    <div class="input-group">
+                        <label>HF Token (Opcional)</label>
+                        <input type="password" id="hf-token" placeholder="huggingface_token...">
+                    </div>
+                    <button id="btn-reload" class="btn btn-secondary">Cargar Modelos Reales</button>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="section-title">Imagen Médica</div>
+                <div class="upload-zone" id="upload-zone">
+                    <i data-lucide="upload-cloud" class="upload-icon"></i>
+                    <p class="upload-text"><strong>Haz clic</strong> o arrastra una imagen</p>
+                    <p class="upload-hint">PNG, JPEG, NIfTI (2D/3D)</p>
+                    <input type="file" id="file-input" accept=".png,.jpg,.jpeg,.nii,.nii.gz,.mha" hidden>
+                </div>
+                <div id="loading-indicator" class="hidden">
+                    <div class="spinner"></div>
+                    <p>Procesando inferencia...</p>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="section-title">Configuración</div>
+                <div class="slider-group">
+                    <label>Umbral OOD: <span id="ood-val">85</span>%</label>
+                    <input type="range" id="ood-slider" min="50" max="99" value="85">
+                </div>
+
+                <div class="divider"></div>
+                <div class="stats">
+                    <div class="stat-box">
+                        <div class="stat-label">Inferencias Totales</div>
+                        <div class="stat-value" id="total-inferences">0</div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="top-header">
+                <h2>Dashboard de Clasificación Médica</h2>
+                <div class="badge-version">v2.0 Professional</div>
+            </header>
+
+            <div class="empty-state" id="empty-state">
+                <div class="empty-icon-wrapper">
+                    <i data-lucide="image" class="empty-icon"></i>
+                    <div class="pulse-ring"></div>
+                </div>
+                <h3>Esperando imagen...</h3>
+                <p>Sube un archivo médico desde el panel lateral para iniciar la inferencia MoE. El sistema procesará la imagen utilizando el enrutador y el experto adecuado.</p>
+            </div>
+
+            <div class="dashboard-grid hidden" id="results-state">
+                <!-- OOD Alert Full Width -->
+                <div class="ood-alert hidden" id="ood-alert">
+                    <div class="ood-icon"><i data-lucide="alert-triangle"></i></div>
+                    <div class="ood-text">
+                        <h4>OOD — Imagen fuera de distribución detectada</h4>
+                        <p id="ood-details">Entropía: 0.00 nats • Umbral: 0.00</p>
+                    </div>
+                </div>
+
+                <!-- Top Row: Images -->
+                <div class="grid-col span-4 card image-card">
+                    <h3 class="card-title">Imagen Original</h3>
+                    <div class="image-wrapper">
+                        <img id="img-original" src="" alt="Original">
+                    </div>
+                    <div class="img-meta" id="img-meta">2D | Original: (1024, 1024) | Adaptado: (1, 3, 224, 224)</div>
+                </div>
+
+                <div class="grid-col span-4 card image-card">
+                    <h3 class="card-title">Attention Heatmap (Router ViT)</h3>
+                    <div class="image-wrapper">
+                        <img id="img-heatmap" src="" alt="Heatmap">
+                    </div>
+                </div>
+
+                <div class="grid-col span-4 stack">
+                    <!-- Prediction -->
+                    <div class="card pred-card" id="pred-card">
+                        <h3 class="card-title">Predicción Top-1</h3>
+                        <div class="pred-value" id="pred-label">Melanoma</div>
+                        <div class="conf-bar-wrapper">
+                            <div class="conf-info">
+                                <span>Confianza</span>
+                                <span id="conf-val">98.5%</span>
+                            </div>
+                            <div class="bar-track"><div class="bar-fill" id="conf-bar" style="width: 98.5%"></div></div>
+                        </div>
+                    </div>
+
+                    <!-- Latency -->
+                    <div class="card latency-card">
+                        <h3 class="card-title">Latencia <span class="badge" id="total-ms">150.2 ms</span></h3>
+                        <div class="latency-grid">
+                            <div class="l-item">
+                                <span class="l-label">Prepro</span>
+                                <span class="l-val" id="ms-pre">12.1</span>
+                            </div>
+                            <div class="l-item">
+                                <span class="l-label">Router</span>
+                                <span class="l-val" id="ms-router">45.0</span>
+                            </div>
+                            <div class="l-item">
+                                <span class="l-label">Experto</span>
+                                <span class="l-val" id="ms-expert">93.1</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Middle Row: Experts & Routing -->
+                <div class="grid-col span-6 card">
+                    <h3 class="card-title">Gating Scores del Router</h3>
+                    <div class="gating-list" id="gating-list">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+
+                <div class="grid-col span-6 card expert-details">
+                    <h3 class="card-title">Experto Activado</h3>
+                    <div class="expert-header">
+                        <i data-lucide="cpu"></i>
+                        <span id="expert-name">E1: ISIC 2019</span>
+                    </div>
+                    <div class="detail-row"><span class="d-label">Arquitectura</span><span class="d-val" id="exp-arch">EfficientNet-B3</span></div>
+                    <div class="detail-row"><span class="d-label">Dataset Base</span><span class="d-val" id="exp-data">ISIC</span></div>
+                    <div class="detail-row"><span class="d-label">Clases (Experto)</span><span class="d-val" id="exp-classes">8</span></div>
+                </div>
+
+                <!-- Bottom Row: Tabs -->
+                <div class="grid-col span-12 card tabs-card">
+                    <div class="tabs-header">
+                        <button class="tab-btn active" data-tab="ablation">Ablation Study</button>
+                        <button class="tab-btn" data-tab="balance">Load Balance</button>
+                        <button class="tab-btn" data-tab="probs">Probabilidades</button>
+                        <button class="tab-btn" data-tab="history">Historial</button>
+                    </div>
+                    
+                    <div class="tab-content active" id="tab-ablation">
+                        <table class="data-table">
+                            <thead>
+                                <tr><th>Router</th><th>Tipo</th><th>Routing Acc.</th><th>Balance Ratio</th></tr>
+                            </thead>
+                            <tbody>
+                                <tr class="best-row">
+                                    <td><strong>ViT + k-NN (FAISS)</strong> <span class="tag-best">Best</span></td>
+                                    <td>No paramétrico</td><td class="text-green">95.28%</td><td>1.93</td>
+                                </tr>
+                                <tr>
+                                    <td>ViT + Naive Bayes</td><td>Paramétrico</td><td class="text-green">81.57%</td><td>2.40</td>
+                                </tr>
+                                <tr>
+                                    <td>ViT + Linear (DL)</td><td>Gradiente</td><td class="text-red">34.16%</td><td>>1M</td>
+                                </tr>
+                                <tr>
+                                    <td>ViT + GMM</td><td>EM</td><td class="text-red">12.47%</td><td>9.85</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="tab-content" id="tab-balance">
+                        <div class="balance-container">
+                            <div class="balance-ratio" id="balance-ratio-box">
+                                <div class="ratio-val" id="ratio-val">1.00</div>
+                                <div class="ratio-label">Ratio Max/Min</div>
+                            </div>
+                            <div class="balance-bars" id="balance-bars">
+                                <!-- Populated by JS -->
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="tab-content" id="tab-probs">
+                        <table class="data-table" id="probs-table">
+                            <thead>
+                                <tr><th>Clase</th><th>Probabilidad</th><th>Barra</th></tr>
+                            </thead>
+                            <tbody>
+                                <!-- Populated by JS -->
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="tab-content" id="tab-history">
+                        <table class="data-table" id="history-table">
+                            <thead>
+                                <tr><th>#</th><th>Archivo</th><th>Predicción</th><th>Confianza</th><th>Experto</th><th>OOD</th></tr>
+                            </thead>
+                            <tbody id="history-tbody">
+                                <!-- Populated by JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="/static/app.js"></script>
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+</html>

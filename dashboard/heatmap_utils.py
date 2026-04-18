@@ -88,6 +88,10 @@ def generate_real_heatmap(image_pil, attn_weights, patch_grid_size):
     if img_np.ndim == 2:
         img_np = np.stack([img_np] * 3, axis=-1)
 
+    # Soportar tensores con batch dimension [B, H, S, S] o sin ella [H, S, S]
+    if attn_weights.ndim == 4:
+        attn_weights = attn_weights[0]  # usar el primer sample del batch
+
     # Promediar sobre las cabezas de atencion
     attn = attn_weights.mean(dim=0)  # [seq_len, seq_len]
 

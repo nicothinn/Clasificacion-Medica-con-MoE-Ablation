@@ -8,6 +8,11 @@ Reglas de la consigna:
   - 2D (PNG/JPEG) → [3, 224, 224]
   - 3D (NIfTI)    → [1, 64, 64, 64]
   - Sin metadatos: solo la forma del tensor determina 2D vs 3D
+
+Nota sobre normalización:
+  - El tensor devuelto por process_uploaded_file está en rango [0, 1] (raw).
+  - La normalización ImageNet se aplica POR SEPARADO en moe_inference.py
+    ya que el Router y cada Experto requieren normalizaciones distintas.
 """
 
 import io
@@ -43,16 +48,30 @@ class AdaptivePreprocessor:
     NUNCA recibe metadatos ni etiquetas (prohibido por la consigna).
     """
 
+    # Normalización ImageNet (consigna §2: exigida por ViT)
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD  = [0.229, 0.224, 0.225]
+
     def __init__(self, size_2d=(224, 224), size_3d=(64, 64, 64),
                  hu_window=(-1000, 400)):
         self.size_2d = size_2d
         self.size_3d = size_3d
         self.hu_min, self.hu_max = hu_window
 
+        # Transform 2D: solo Resize + ToTensor → rango [0, 1]
         self.transform_2d = T.Compose([
             T.Resize(size_2d),
             T.ToTensor(),
         ])
+
+    @staticmethod
+    def apply_imagenet_norm(tensor):
+        """Aplica normalización ImageNet a un tensor [C, H, W] o [B, C, H, W]."""
+        norm = T.Normalize(
+            mean=AdaptivePreprocessor.IMAGENET_MEAN,
+            std=AdaptivePreprocessor.IMAGENET_STD,
+        )
+        return norm(tensor)
 
     def process_uploaded_file(self, uploaded_file):
         """
