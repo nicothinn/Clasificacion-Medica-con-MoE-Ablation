@@ -85,17 +85,28 @@ document.addEventListener('DOMContentLoaded', () => {
         e.preventDefault();
         uploadZone.classList.remove('dragover');
         if (e.dataTransfer.files.length > 0) {
-            handleFile(e.dataTransfer.files[0]);
+            handleFiles(e.dataTransfer.files);
         }
     });
 
     fileInput.addEventListener('change', (e) => {
         if (e.target.files.length > 0) {
-            handleFile(e.target.files[0]);
+            handleFiles(e.target.files);
         }
     });
 
-    async function handleFile(file) {
+    async function handleFiles(fileList) {
+        const files = Array.from(fileList);
+        
+        // Validacion visual de MHD + RAW
+        const hasMhd = files.some(f => f.name.toLowerCase().endsWith('.mhd'));
+        const hasRaw = files.some(f => f.name.toLowerCase().endsWith('.raw') || f.name.toLowerCase().endsWith('.zraw'));
+        if (hasMhd && !hasRaw) {
+            alert("Has seleccionado un archivo .mhd pero falta el .raw/.zraw correspondiente. Por favor, asegúrate de seleccionar ambos al mismo tiempo.");
+            fileInput.value = "";
+            return;
+        }
+
         // UI Transition
         emptyState.classList.add('hidden');
         resultsState.classList.add('hidden');
@@ -103,19 +114,30 @@ document.addEventListener('DOMContentLoaded', () => {
         loadingIndicator.classList.remove('hidden');
 
         systemLog.innerHTML = '';
-        const shortName = file.name.length > 25 ? file.name.substring(0, 22) + '...' : file.name;
-        agregarAlLog(`Archivo cargado: ${shortName}`, 'info');
+        const mainFile = files.find(f => !f.name.toLowerCase().endsWith('.raw') && !f.name.toLowerCase().endsWith('.zraw')) || files[0];
+        const shortName = mainFile.name.length > 25 ? mainFile.name.substring(0, 22) + '...' : mainFile.name;
+        agregarAlLog(`Procesando ${files.length} archivo(s): ${shortName}`, 'info');
+        
         setTimeout(() => {
-            agregarAlLog(`Extrayendo features ${file.name.toLowerCase().endsWith('.nii') || file.name.toLowerCase().endsWith('.nii.gz') || file.name.toLowerCase().endsWith('.mha') ? '3D' : '2D'}...`, 'info');
+            const is3D = files.some(f => f.name.toLowerCase().match(/\.(nii|nii\.gz|mha|mhd)$/));
+            agregarAlLog(`Extrayendo features ${is3D ? '3D' : '2D'}...`, 'info');
         }, 300);
 
         const formData = new FormData();
-        formData.append("file", file);
+        files.forEach(f => {
+            formData.append("files", f); // Cambiado a 'files' plural
+        });
         
-        // Get clinical source if specified
+        // Debugging frontend: verificar qué archivos van en el FormData
+        const archivosAdjuntos = formData.getAll("files").map(f => f.name);
+        console.log("Archivos adjuntos en FormData:", archivosAdjuntos);
+        
+        // Get clinical source if specified (or default to 'unknown')
         const sourceSelect = document.getElementById('data-source');
         if (sourceSelect) {
             formData.append("source", sourceSelect.value);
+        } else {
+            formData.append("source", "unknown");
         }
 
         try {

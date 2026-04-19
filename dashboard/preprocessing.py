@@ -73,84 +73,147 @@ class AdaptivePreprocessor:
         )
         return norm(tensor)
 
-    def _is_nih_or_osteo(self, filename: str, source: str = "unknown"):
-        p = filename.lower()
-        is_nih = source == 'nih' or ('nih chest x ray 14' in p) or ('nih' in p)
-        is_osteo = source == 'osteo' or ('knee osteoarthritis' in p) or ('osteo' in p)
-        return is_nih, is_osteo
-
-    def _clahe_nih_rgb(self, img_rgb_u8: np.ndarray) -> np.ndarray:
-        lab = cv2.cvtColor(img_rgb_u8, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        hist = cv2.calcHist([l], [0], None, [256], [0, 256]).flatten()
-        peaks = int(np.sum(hist > hist.mean()))
-        tile_size = max(2, int(np.ceil(np.log(max(peaks, 2)))))
-        valleys = hist[hist <= hist.mean()]
-        val_mean = float(valleys.mean()) if len(valleys) > 0 else 1.0
-        clip = float(np.clip(hist.max() / (val_mean + 1e-6), 1.0, 4.0))
-        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile_size, tile_size))
-        l_eq = clahe.apply(l)
-        lab_eq = cv2.merge((l_eq, a, b))
-        arr_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
-        return cv2.GaussianBlur(arr_eq, (5, 5), sigmaX=1.0)
-
-    def _clahe_osteo_gray_to_rgb(self, img_rgb_u8: np.ndarray) -> np.ndarray:
-        g = cv2.cvtColor(img_rgb_u8, cv2.COLOR_RGB2GRAY)
-        hist = cv2.calcHist([g], [0], None, [256], [0, 256]).flatten()
-        tile_size = max(2, int(np.ceil(np.log(max(int(np.sum(hist > hist.mean())), 2)))))
-        valleys = hist[hist <= hist.mean()]
-        val_mean = float(valleys.mean()) if len(valleys) > 0 else 1.0
-        clip = float(np.clip(hist.max() / (val_mean + 1e-6), 1.0, 4.0))
-        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile_size, tile_size))
-        enhanced = clahe.apply(g)
-        return np.repeat(enhanced[:, :, None], 3, axis=2)
-
-
-
-    def process_uploaded_file(self, uploaded_file, source="unknown"):
+    @staticmethod
+    def apply_conditional_clahe(img_pil: Image.Image) -> np.ndarray:
         """
-        Procesa un archivo subido via st.file_uploader.
-
-        Args:
-            uploaded_file: objeto UploadedFile de Streamlit
-            source: string indicando el dataset de origen
-
-        Returns:
-            tensor:         torch.Tensor preprocesado
-            original_shape: tuple con dimensiones originales
-            is_3d:          bool
+        Detecta si la imagen es escala de grises y aplica CLAHE condicionalmente.
+        Si es RGB (color real), no aplica CLAHE para no distorsionar colores.
         """
-        filename = uploaded_file.name.lower()
-        file_bytes = uploaded_file.read()
-        uploaded_file.seek(0)  # reset para posibles re-lecturas
-
-        if filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
-            return self._process_2d_bytes(file_bytes, filename, source)
-
-        elif filename.endswith((".nii", ".nii.gz")):
-            return self._process_nifti_bytes(file_bytes, filename, source)
-
-        elif filename.endswith(".mha"):
-            return self._process_mha_bytes(file_bytes, filename, source)
-
+        arr_rgb = np.array(img_pil.convert("RGB"))
+        
+        # Deteccion de escala de grises:
+        # Calculamos la varianza entre los canales R, G, B para cada pixel
+        # Si la imagen es grayscale, R=G=B, por lo que la varianza es ~0.
+        channel_var = np.var(arr_rgb, axis=2).mean()
+        is_grayscale = channel_var < 5.0  # Umbral bajo para tolerar artefactos de compresion
+        
+        if is_grayscale:
+            # Aplicar CLAHE a la imagen médica en escala de grises (Rayos X, Osteo, etc.)
+            gray = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            return np.repeat(enhanced[:, :, None], 3, axis=2)
         else:
-            raise ValueError(
-                f"Formato no soportado: {filename}\n"
-                f"Formatos validos: PNG, JPEG, NIfTI (.nii/.nii.gz), MHA"
-            )
+            # Si es imagen a color RGB (Dermatología), omitir CLAHE por completo
+            return arr_rgb
+
+
+
+    def process_uploaded_file(self, uploaded_files, source="unknown"):
+        """
+        Procesa archivos subidos (UploadFile) de forma segura en un entorno temporal.
+        """
+        if not isinstance(uploaded_files, list):
+            uploaded_files = [uploaded_files]
+            
+        import tempfile
+        import os
+        import shutil
+        
+        main_file = None
+        main_path = None
+        image_array = None
+        original_shape = None
+        is_mhd = False
+        file_bytes = None
+        
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            # 1. Guardar todos los archivos con sus nombres originales
+            for f in uploaded_files:
+                original_name = os.path.basename(f.filename)
+                path = os.path.join(tmpdirname, original_name)
+                
+                with open(path, "wb") as buffer:
+                    shutil.copyfileobj(f.file, buffer)
+                f.file.seek(0)  # Resetear para la UI
+                
+                # 2. Identificar el archivo principal
+                lower_name = original_name.lower()
+                if lower_name.endswith((".png", ".jpg", ".jpeg", ".nii", ".nii.gz", ".mha", ".mhd")):
+                    main_file = f
+                    main_path = path
+
+            if not main_file:
+                raise ValueError("No se encontró archivo principal válido (.mhd, .nii, .png, etc.)")
+
+            filename = os.path.basename(main_file.filename).lower()
+            
+            # 3 y 4. Lectura AÚN DENTRO del bloque
+            if filename.endswith(".mhd"):
+                if not HAS_SITK:
+                    raise ImportError("SimpleITK requerido para archivos MHD.")
+                
+                # Inspección y validación del MHD
+                raw_filename = None
+                with open(main_path, "r", encoding="utf-8", errors="ignore") as f_mhd:
+                    for line in f_mhd:
+                        if line.startswith("ElementDataFile"):
+                            raw_filename = line.split("=")[1].strip()
+                            break
+                
+                if raw_filename:
+                    expected_raw_path = os.path.join(tmpdirname, raw_filename)
+                    if not os.path.exists(expected_raw_path):
+                        # El nombre no coincide exactamente. Buscamos cualquier .raw o .zraw subido y lo renombramos.
+                        found_raw = None
+                        for f_name in os.listdir(tmpdirname):
+                            if f_name.lower().endswith(('.raw', '.zraw')) and f_name != os.path.basename(main_path):
+                                found_raw = os.path.join(tmpdirname, f_name)
+                                break
+                        
+                        if found_raw:
+                            os.rename(found_raw, expected_raw_path)
+                            print(f"Raw renombrado automáticamente de '{os.path.basename(found_raw)}' a '{raw_filename}'")
+                        else:
+                            raise ValueError(f"El archivo MHD requiere el archivo RAW llamado '{raw_filename}', pero no se encontró en la subida.")
+                
+                is_mhd = True
+                itk_image = sitk.ReadImage(main_path)
+                image_array = sitk.GetArrayFromImage(itk_image).astype(np.float32)
+                original_shape = itk_image.GetSize()
+            else:
+                with open(main_path, "rb") as bf:
+                    file_bytes = bf.read()
+
+        # AHORA SÍ, salimos del bloque with. La carpeta temporal se ha borrado,
+        # pero image_array y file_bytes están cargados en memoria RAM.
+        
+        if is_mhd:
+            if image_array.ndim == 2 or (image_array.ndim == 3 and image_array.shape[0] == 1):
+                arr_2d = np.squeeze(image_array)
+                if arr_2d.max() > 1.5:
+                    arr_2d = arr_2d / 255.0
+                t = torch.from_numpy(arr_2d).float().unsqueeze(0)
+                t = F.interpolate(t.unsqueeze(0), size=self.size_2d,
+                                  mode="bilinear", align_corners=False).squeeze(0)
+                t = t.repeat(3, 1, 1)
+                return t, original_shape, False, main_file
+
+            tensor = self._normalize_and_resize_3d(image_array, filename, source)
+            return tensor, original_shape, True, main_file
+        else:
+            if file_bytes is None:
+                raise ValueError("No se pudo leer el contenido del archivo.")
+
+            if filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
+                t, s, is3d = self._process_2d_bytes(file_bytes, filename, source)
+            elif filename.endswith((".nii", ".nii.gz")):
+                t, s, is3d = self._process_nifti_bytes(file_bytes, filename, source)
+            elif filename.endswith(".mha"):
+                t, s, is3d = self._process_mha_bytes(file_bytes, filename, source)
+            else:
+                raise ValueError("Formato no soportado")
+                
+            return t, s, is3d, main_file
 
     def _process_2d_bytes(self, file_bytes, filename, source):
         """Procesa imagen 2D desde bytes."""
-        is_nih, is_osteo = self._is_nih_or_osteo(filename, source)
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         original_shape = (img.width, img.height, 3)
         img = img.resize(self.size_2d)
         
+        # IMAGEN INFERENCIA: estrictamente sin CLAHE para evitar domain shift
         arr = np.array(img, dtype=np.uint8)
-        if is_nih:
-            arr = self._clahe_nih_rgb(arr)
-        elif is_osteo:
-            arr = self._clahe_osteo_gray_to_rgb(arr)
             
         t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
         # NO aplicar ImageNet norm aquí: el Router necesita [0,1] crudo.
@@ -213,14 +276,43 @@ class AdaptivePreprocessor:
         finally:
             os.unlink(tmp_path)
 
+    def _process_mhd_path(self, mhd_path, filename, source):
+        """Procesa volumen MHD leyendo desde un directorio temporal donde está el .raw."""
+        if not HAS_SITK:
+            raise ImportError("SimpleITK requerido para archivos MHD.")
+
+        itk_img = sitk.ReadImage(mhd_path)
+        img_arr = sitk.GetArrayFromImage(itk_img).astype(np.float32)
+        original_shape = itk_img.GetSize()
+
+        if img_arr.ndim == 2 or (img_arr.ndim == 3 and img_arr.shape[0] == 1):
+            arr_2d = np.squeeze(img_arr)
+            if arr_2d.max() > 1.5:
+                arr_2d = arr_2d / 255.0
+            t = torch.from_numpy(arr_2d).float().unsqueeze(0)
+            t = F.interpolate(t.unsqueeze(0), size=self.size_2d,
+                              mode="bilinear", align_corners=False).squeeze(0)
+            t = t.repeat(3, 1, 1)
+            return t, original_shape, False
+
+        tensor = self._normalize_and_resize_3d(img_arr, filename, source)
+        return tensor, original_shape, True
+
     def _normalize_and_resize_3d(self, img_arr, filename="", source="unknown"):
         """
         Aplica HU windowing [-1000, 400] -> [0, 1] y resize a 64^3.
         """
         amin, amax = float(np.nanmin(img_arr)), float(np.nanmax(img_arr))
+        
+        # Corrección dinámica para LUNA16 u otros datasets guardados como unsigned (Shift +1024)
+        if amin >= 0 and amax > 1000:
+            img_arr = img_arr - 1024
+            amin, amax = float(np.nanmin(img_arr)), float(np.nanmax(img_arr))
+
         pre_norm = amax <= 1.5 and amin >= -1e-2 and ('pancreas' in filename.lower() or source == 'pancreas')
         
         if not pre_norm:
+            # Ventana radiológica para Pulmón/Tórax (ej. LUNA16)
             img_arr = np.clip(img_arr, self.hu_min, self.hu_max)
             img_arr = (img_arr - self.hu_min) / (self.hu_max - self.hu_min + 1e-8)
         else:
@@ -250,8 +342,11 @@ def get_display_image(uploaded_file, tensor, is_3d):
         PIL.Image para mostrar en st.image()
     """
     if not is_3d:
+        # IMAGEN VISUAL: Le aplicamos CLAHE solo a la copia que va al dashboard
         uploaded_file.seek(0)
-        return Image.open(uploaded_file).convert("RGB")
+        img_pil = Image.open(uploaded_file).convert("RGB")
+        arr_visual = AdaptivePreprocessor.apply_conditional_clahe(img_pil)
+        return Image.fromarray(arr_visual).convert("RGB")
 
     # Para 3D: tomar el slice axial central
     vol = tensor.squeeze(0).numpy()  # [D, H, W]
