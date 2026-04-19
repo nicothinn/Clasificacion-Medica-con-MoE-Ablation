@@ -26,8 +26,8 @@ from PIL import Image
 from huggingface_hub import hf_hub_download
 
 from real_models import (
-    VisionRouter, LungMaxViT, build_efficientnet_b3_expert,
-    build_vgg16_bn_expert, DCSwinBStyle3D, R3D18Expert,
+    VisionRouter, SwinNIHClassifier, build_efficientnet_b3_expert,
+    build_vgg16_bn_expert, R3D18LunaKineticsExpert, R3D18Expert,
 )
 from mock_models import EXPERT_INFO
 from preprocessing import AdaptivePreprocessor, get_display_image
@@ -130,14 +130,14 @@ class MoEInferenceEngine:
         experts = {}
         
         weight_maps = {
-            0: ("exp1_NIH_LungMaxViT_best.pth",
-                lambda: LungMaxViT(num_classes=14)),
+            0: ("MaxViT_NIH_5cls.pth",
+                lambda: SwinNIHClassifier(num_classes=5)),
             1: ("exp2_ISIC_EfficientNetB3_best.pth.zip",
                 lambda: build_efficientnet_b3_expert(num_classes=8)),
             2: ("exp3_Osteo_VGG16BN_best.pth",
                 lambda: build_vgg16_bn_expert(num_classes=5)),
             3: ("exp4_LUNA16_3D_best.pth",
-                lambda: DCSwinBStyle3D(num_classes=2)),
+                lambda: R3D18LunaKineticsExpert(num_classes=2)),
             4: ("exp5_Pancreas_3D_best.pth",
                 lambda: R3D18Expert(num_classes=2)),
         }
@@ -166,7 +166,7 @@ class MoEInferenceEngine:
                 elif "model" in state_dict:
                     state_dict = state_dict["model"]
             
-            model.load_state_dict(state_dict)
+            model.load_state_dict(state_dict, strict=False)
             experts[eid] = model.to(self.device)
 
         return router, experts
@@ -190,78 +190,74 @@ class MoEInferenceEngine:
         """
         Prepara el tensor para el Router.
         
-        El Router fue entrenado con:
-        - 2D: AdaptivePreprocessor -> ViT_AdapterWrapper -> ImageNet norm
-        - 3D: AdaptivePreprocessor (HU windowed [0,1]) sin norm adicional
-        
-        El SwitchablePatchEmbed acepta tensores sin batch dim,
-        pero se lo añadimos por consistencia.
+        El Router recibe tensores en rango [0, 1] (con CLAHE si aplica).
+        NO se aplica ImageNet norm aquí — el checkpoint router_professor_fase3_only.pth
+        colapsa a ISIC si recibe tensores normalizados con ImageNet.
         """
         t = tensor_raw.to(self.device)
-        if is_3d:
-            # 3D volumes: already in [0,1] from HU windowing, no extra norm
-            if t.ndim == 4:
-                t = t.unsqueeze(0)
-            return t
-        else:
-            # 2D: El Router funciona mejor con el tensor crudo [0,1]
-            # (ImageNet norm sobre radiografías distorsiona el CLS token y causa colapso a ISIC)
-            if t.ndim == 3:
-                t = t.unsqueeze(0)
-            return t
+        if t.ndim == 3:
+            t = t.unsqueeze(0)
+        elif t.ndim == 4 and is_3d:
+            t = t.unsqueeze(0)
+        return t
+
+    def luna_1ch_to_kinetics_3ch(self, t):
+        """[B,1,D,H,W] en [0,1] → [B,3,D,H,W] con normalización Kinetics-400."""
+        mean = torch.tensor([0.43216, 0.394666, 0.37645]).view(3, 1, 1, 1).to(t.device, dtype=t.dtype)
+        std = torch.tensor([0.22803, 0.22145, 0.216989]).view(3, 1, 1, 1).to(t.device, dtype=t.dtype)
+        t3 = t.expand(-1, 3, -1, -1, -1)
+        return (t3 - mean) / std
 
     def _prepare_expert_tensor(self, tensor_raw, is_3d, expert_id):
         """
         Prepara el tensor para el Experto seleccionado.
         
+        tensor_raw llega en [0, 1] (con CLAHE si aplica).
         Cada experto fue entrenado con su propia normalización:
-          - Exp 0 (NIH LungMaxViT): 3 canales, ImageNet norm
-          - Exp 1 (ISIC EfficientNet): 3 canales, ImageNet norm
-          - Exp 2 (Osteo VGG-16 BN): 1 canal, z-score normalization
-          - Exp 3 (LUNA16 DCSwinB): 1 canal 3D, [0,1] (HU windowed)
-          - Exp 4 (Pancreas R3D-18): 3 canales 3D, [0,1]
-        
-        Todos los tensors se devuelven con batch dimension [B, ...].
+          - Exp 0 (NIH SwinTiny): 3ch, ImageNet norm
+          - Exp 1 (ISIC EfficientNet): 3ch, ImageNet norm
+          - Exp 2 (Osteo VGG-16 BN): 1 canal grayscale, ImageNet norm en RGB base
+          - Exp 3 (LUNA16 R3D-18): 3ch Kinetics norm
+          - Exp 4 (Pancreas R3D-18): 3ch, raw [0,1]
         """
-        if expert_id == 0:  # NIH LungMaxViT — 3ch + ImageNet norm
+        if expert_id == 0:  # NIH SwinTiny — 3ch + ImageNet norm
             t = AdaptivePreprocessor.apply_imagenet_norm(tensor_raw)
             if t.ndim == 3:
-                t = t.unsqueeze(0)  # [3,H,W] -> [1,3,H,W]
+                t = t.unsqueeze(0)
             return t.to(self.device)
 
         elif expert_id == 1:  # ISIC EfficientNet-B3 — 3ch + ImageNet norm
             t = AdaptivePreprocessor.apply_imagenet_norm(tensor_raw)
             if t.ndim == 3:
-                t = t.unsqueeze(0)  # [3,H,W] -> [1,3,H,W]
+                t = t.unsqueeze(0)
             return t.to(self.device)
 
         elif expert_id == 2:  # Osteo VGG-16 BN — 1ch grayscale
-            # Convertir RGB [3,H,W] a grayscale [1,H,W]
             if tensor_raw.ndim == 3 and tensor_raw.shape[0] == 3:
-                gray = tensor_raw.mean(dim=0, keepdim=True)  # [1, H, W]
-                gray = gray.unsqueeze(0)  # [1, 1, H, W]
+                gray = tensor_raw.mean(dim=0, keepdim=True)
+                gray = gray.unsqueeze(0)
             elif tensor_raw.ndim == 4 and tensor_raw.shape[1] == 3:
-                gray = tensor_raw.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+                gray = tensor_raw.mean(dim=1, keepdim=True)
             else:
                 gray = tensor_raw
                 if gray.ndim == 3:
                     gray = gray.unsqueeze(0)
             return gray.to(self.device)
 
-        elif expert_id == 3:  # LUNA16 3D — 1ch, ya en [0,1]
+        elif expert_id == 3:  # LUNA16 3D — 3ch con Kinetics norm
             t = tensor_raw
             if t.ndim == 4:
-                t = t.unsqueeze(0)  # [1,D,H,W] -> [1,1,D,H,W]
-            return t.to(self.device)
+                t = t.unsqueeze(0)
+            t = t.to(self.device)
+            return self.luna_1ch_to_kinetics_3ch(t)
 
         elif expert_id == 4:  # Pancreas R3D-18 — 3 canales 3D
             t = tensor_raw
-            # Añadir batch dim si no la tiene
             if t.ndim == 4:
-                t = t.unsqueeze(0)  # [C,D,H,W] -> [1,C,D,H,W]
+                t = t.unsqueeze(0)
             # El checkpoint fue entrenado con 3 canales de entrada
             if t.shape[1] == 1:
-                t = t.repeat(1, 3, 1, 1, 1)  # [1,1,D,H,W] -> [1,3,D,H,W]
+                t = t.repeat(1, 3, 1, 1, 1)
             return t.to(self.device)
 
         else:
@@ -271,12 +267,13 @@ class MoEInferenceEngine:
             return t.to(self.device)
 
     @torch.no_grad()
-    def run(self, uploaded_file) -> InferenceResult:
+    def run(self, uploaded_file, source="unknown") -> InferenceResult:
         """
         Ejecuta el pipeline completo de inferencia.
 
         Args:
             uploaded_file: archivo subido via st.file_uploader
+            source: origen del dataset (e.g. 'nih', 'osteo', 'pancreas')
 
         Returns:
             InferenceResult con todos los campos poblados
@@ -288,7 +285,7 @@ class MoEInferenceEngine:
         # tensor_raw está en rango [0, 1] (sin normalización ImageNet)
         t0 = time.perf_counter()
         tensor_raw, original_shape, is_3d = self.preprocessor.process_uploaded_file(
-            uploaded_file
+            uploaded_file, source=source
         )
         result.preprocess_ms = (time.perf_counter() - t0) * 1000
         result.original_shape = original_shape

@@ -19,13 +19,11 @@ import numpy as np
 EXPERT_INFO = {
     0: {
         "name": "Expert 1 — NIH (Profesor)",
-        "arch": "LungMaxViT",
+        "arch": "Swin-Tiny",
         "dataset": "NIH ChestX-ray 14",
-        "num_classes": 14,
+        "num_classes": 5,
         "class_names": [
-            "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", 
-            "Effusion", "Emphysema", "Fibrosis", "Hernia", "Infiltration", 
-            "Mass", "Nodule", "Pleural Thickening", "Pneumonia", "Pneumothorax"
+            "Mass", "Nodule", "Effusion", "Cardiomegaly", "Pneumothorax"
         ],
         "is_3d": False,
     },
@@ -35,9 +33,8 @@ EXPERT_INFO = {
         "dataset": "ISIC 2019",
         "num_classes": 8,
         "class_names": [
-            "Melanoma", "Melanocytic nevus", "BCC", "Actinic keratosis",
-            "Benign keratosis", "Dermatofibroma", "Vascular lesion",
-            "SCC",
+            "MEL", "NV", "BCC", "AK",
+            "BKL", "DF", "VASC", "SCC",
         ],
         "is_3d": False,
     },
@@ -51,7 +48,7 @@ EXPERT_INFO = {
     },
     3: {
         "name": "Expert 4 — LUNA16",
-        "arch": "DCSwinB-Style 3D",
+        "arch": "R3D-18 (Kinetics 3ch)",
         "dataset": "LUNA16 / LIDC-IDRI",
         "num_classes": 2,
         "class_names": ["Benigno", "Maligno"],

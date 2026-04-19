@@ -35,6 +35,7 @@
                     <p class="upload-hint">PNG, JPEG, NIfTI (2D/3D)</p>
                     <input type="file" id="file-input" accept=".png,.jpg,.jpeg,.nii,.nii.gz,.mha" hidden>
                 </div>
+
                 <div id="loading-indicator" class="hidden">
                     <p class="loading-text">Analizando muestra anatómica...</p>
                 </div>
@@ -152,7 +153,10 @@
                     <div class="card pred-card" id="pred-card">
                         <h3 class="card-title"><i data-lucide="activity"></i> Predicción Top-1</h3>
                         <div class="pred-value" id="pred-label">Melanoma</div>
-                        <div class="conf-bar-wrapper">
+                        <p id="ood-explainer" class="hidden" style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem; line-height: 1.4;">
+                            La imagen proporcionada no presenta características clínicas compatibles con los dominios médicos (Tórax, Piel, Osteo) de este sistema. Por favor, suba una muestra válida.
+                        </p>
+                        <div class="conf-bar-wrapper" id="conf-wrapper">
                             <div class="conf-info">
                                 <span>Confianza</span>
                                 <span id="conf-val">98.5%</span>

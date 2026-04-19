@@ -21,6 +21,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+import cv2
 from PIL import Image
 import torchvision.transforms as T
 
@@ -58,7 +59,7 @@ class AdaptivePreprocessor:
         self.size_3d = size_3d
         self.hu_min, self.hu_max = hu_window
 
-        # Transform 2D: solo Resize + ToTensor → rango [0, 1]
+        # Transform 2D: Resize + ToTensor
         self.transform_2d = T.Compose([
             T.Resize(size_2d),
             T.ToTensor(),
@@ -66,19 +67,53 @@ class AdaptivePreprocessor:
 
     @staticmethod
     def apply_imagenet_norm(tensor):
-        """Aplica normalización ImageNet a un tensor [C, H, W] o [B, C, H, W]."""
         norm = T.Normalize(
             mean=AdaptivePreprocessor.IMAGENET_MEAN,
             std=AdaptivePreprocessor.IMAGENET_STD,
         )
         return norm(tensor)
 
-    def process_uploaded_file(self, uploaded_file):
+    def _is_nih_or_osteo(self, filename: str, source: str = "unknown"):
+        p = filename.lower()
+        is_nih = source == 'nih' or ('nih chest x ray 14' in p) or ('nih' in p)
+        is_osteo = source == 'osteo' or ('knee osteoarthritis' in p) or ('osteo' in p)
+        return is_nih, is_osteo
+
+    def _clahe_nih_rgb(self, img_rgb_u8: np.ndarray) -> np.ndarray:
+        lab = cv2.cvtColor(img_rgb_u8, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        hist = cv2.calcHist([l], [0], None, [256], [0, 256]).flatten()
+        peaks = int(np.sum(hist > hist.mean()))
+        tile_size = max(2, int(np.ceil(np.log(max(peaks, 2)))))
+        valleys = hist[hist <= hist.mean()]
+        val_mean = float(valleys.mean()) if len(valleys) > 0 else 1.0
+        clip = float(np.clip(hist.max() / (val_mean + 1e-6), 1.0, 4.0))
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile_size, tile_size))
+        l_eq = clahe.apply(l)
+        lab_eq = cv2.merge((l_eq, a, b))
+        arr_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+        return cv2.GaussianBlur(arr_eq, (5, 5), sigmaX=1.0)
+
+    def _clahe_osteo_gray_to_rgb(self, img_rgb_u8: np.ndarray) -> np.ndarray:
+        g = cv2.cvtColor(img_rgb_u8, cv2.COLOR_RGB2GRAY)
+        hist = cv2.calcHist([g], [0], None, [256], [0, 256]).flatten()
+        tile_size = max(2, int(np.ceil(np.log(max(int(np.sum(hist > hist.mean())), 2)))))
+        valleys = hist[hist <= hist.mean()]
+        val_mean = float(valleys.mean()) if len(valleys) > 0 else 1.0
+        clip = float(np.clip(hist.max() / (val_mean + 1e-6), 1.0, 4.0))
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile_size, tile_size))
+        enhanced = clahe.apply(g)
+        return np.repeat(enhanced[:, :, None], 3, axis=2)
+
+
+
+    def process_uploaded_file(self, uploaded_file, source="unknown"):
         """
         Procesa un archivo subido via st.file_uploader.
 
         Args:
             uploaded_file: objeto UploadedFile de Streamlit
+            source: string indicando el dataset de origen
 
         Returns:
             tensor:         torch.Tensor preprocesado
@@ -90,13 +125,13 @@ class AdaptivePreprocessor:
         uploaded_file.seek(0)  # reset para posibles re-lecturas
 
         if filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
-            return self._process_2d_bytes(file_bytes)
+            return self._process_2d_bytes(file_bytes, filename, source)
 
         elif filename.endswith((".nii", ".nii.gz")):
-            return self._process_nifti_bytes(file_bytes, filename)
+            return self._process_nifti_bytes(file_bytes, filename, source)
 
         elif filename.endswith(".mha"):
-            return self._process_mha_bytes(file_bytes, filename)
+            return self._process_mha_bytes(file_bytes, filename, source)
 
         else:
             raise ValueError(
@@ -104,14 +139,26 @@ class AdaptivePreprocessor:
                 f"Formatos validos: PNG, JPEG, NIfTI (.nii/.nii.gz), MHA"
             )
 
-    def _process_2d_bytes(self, file_bytes):
+    def _process_2d_bytes(self, file_bytes, filename, source):
         """Procesa imagen 2D desde bytes."""
+        is_nih, is_osteo = self._is_nih_or_osteo(filename, source)
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         original_shape = (img.width, img.height, 3)
-        tensor = self.transform_2d(img)  # [3, 224, 224]
-        return tensor, original_shape, False
+        img = img.resize(self.size_2d)
+        
+        arr = np.array(img, dtype=np.uint8)
+        if is_nih:
+            arr = self._clahe_nih_rgb(arr)
+        elif is_osteo:
+            arr = self._clahe_osteo_gray_to_rgb(arr)
+            
+        t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+        # NO aplicar ImageNet norm aquí: el Router necesita [0,1] crudo.
+        # La normalización ImageNet se aplica por separado para cada experto
+        # en moe_inference._prepare_expert_tensor().
+        return t, original_shape, False
 
-    def _process_nifti_bytes(self, file_bytes, filename):
+    def _process_nifti_bytes(self, file_bytes, filename, source):
         """Procesa volumen NIfTI desde bytes (requiere archivo temporal)."""
         if not HAS_NIB:
             raise ImportError("nibabel es necesario para archivos NIfTI. "
@@ -130,12 +177,12 @@ class AdaptivePreprocessor:
             # Transponer desde (X, Y, Z) de nibabel a (Z, Y, X) de numpy/torch
             img_arr = np.transpose(img_arr, (2, 1, 0))
 
-            tensor = self._normalize_and_resize_3d(img_arr)
+            tensor = self._normalize_and_resize_3d(img_arr, filename, source)
             return tensor, original_shape, True
         finally:
             os.unlink(tmp_path)
 
-    def _process_mha_bytes(self, file_bytes, filename):
+    def _process_mha_bytes(self, file_bytes, filename, source):
         """Procesa volumen MHA desde bytes (requiere archivo temporal)."""
         if not HAS_SITK:
             raise ImportError("SimpleITK requerido para archivos MHA. "
@@ -161,18 +208,23 @@ class AdaptivePreprocessor:
                 t = t.repeat(3, 1, 1)  # [1,H,W] -> [3,H,W]
                 return t, original_shape, False
 
-            tensor = self._normalize_and_resize_3d(img_arr)
+            tensor = self._normalize_and_resize_3d(img_arr, filename, source)
             return tensor, original_shape, True
         finally:
             os.unlink(tmp_path)
 
-    def _normalize_and_resize_3d(self, img_arr):
+    def _normalize_and_resize_3d(self, img_arr, filename="", source="unknown"):
         """
         Aplica HU windowing [-1000, 400] -> [0, 1] y resize a 64^3.
         """
-        # HU windowing
-        img_arr = np.clip(img_arr, self.hu_min, self.hu_max)
-        img_arr = (img_arr - self.hu_min) / (self.hu_max - self.hu_min + 1e-8)
+        amin, amax = float(np.nanmin(img_arr)), float(np.nanmax(img_arr))
+        pre_norm = amax <= 1.5 and amin >= -1e-2 and ('pancreas' in filename.lower() or source == 'pancreas')
+        
+        if not pre_norm:
+            img_arr = np.clip(img_arr, self.hu_min, self.hu_max)
+            img_arr = (img_arr - self.hu_min) / (self.hu_max - self.hu_min + 1e-8)
+        else:
+            img_arr = np.clip(img_arr, 0.0, 1.0)
 
         # Convertir a tensor y resize
         t = torch.tensor(img_arr, dtype=torch.float32)

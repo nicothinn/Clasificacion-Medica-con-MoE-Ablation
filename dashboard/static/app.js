@@ -47,6 +47,17 @@ document.addEventListener('DOMContentLoaded', () => {
     // OOD Threshold — fixed at 85% of max entropy (calibrated value)
     const UMBRAL_OOD_DEFAULT = 0.85;
 
+    function calcularEntropia(gatingScores) {
+        let entropia = 0;
+        for (let i = 0; i < gatingScores.length; i++) {
+            const p = gatingScores[i];
+            if (p > 0) {
+                entropia -= p * Math.log(p);
+            }
+        }
+        return entropia;
+    }
+
     // Tabs
     tabs.forEach(tab => {
         tab.addEventListener('click', () => {
@@ -100,6 +111,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const formData = new FormData();
         formData.append("file", file);
+        
+        // Get clinical source if specified
+        const sourceSelect = document.getElementById('data-source');
+        if (sourceSelect) {
+            formData.append("source", sourceSelect.value);
+        }
 
         try {
             const response = await fetch('/api/predict', {
@@ -184,18 +201,37 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('img-meta').textContent = 
             `${dimStr} | Original: ${data.original_shape.join('x')} | Adaptado: ${data.processed_shape.join('x')}`;
 
-        // OOD — uses hardcoded threshold
+        // OOD — calculate entropy using JS
         const oodAlert = document.getElementById('ood-alert');
-        const isOOD = data.entropy > UMBRAL_OOD_DEFAULT;
+        const calculatedEntropy = calcularEntropia(data.gating_scores);
+        const isOOD = calculatedEntropy > UMBRAL_OOD_DEFAULT;
+        
+        const predCard = document.getElementById('pred-card');
 
         if (isOOD) {
             oodAlert.classList.remove('hidden');
             document.getElementById('ood-details').textContent = 
-                `Entropía: ${data.entropy.toFixed(3)} nats • Umbral: ${UMBRAL_OOD_DEFAULT.toFixed(3)}`;
-            agregarAlLog(`Entropía: ${data.entropy.toFixed(3)} nats (ALERTA OOD)`, 'error');
+                `Entropía: ${calculatedEntropy.toFixed(3)} nats • Umbral: ${UMBRAL_OOD_DEFAULT.toFixed(3)}`;
+            agregarAlLog(`Entropía: ${calculatedEntropy.toFixed(3)} nats (ALERTA OOD)`, 'error');
+            
+            // Block prediction card
+            predCard.style.opacity = '1';
+            document.getElementById('pred-label').textContent = 'IMAGEN NO COMPATIBLE';
+            document.getElementById('pred-label').style.color = 'var(--color-red)';
+            document.getElementById('pred-label').style.fontSize = '1.2rem';
+            
+            // Show explainer, hide confidence
+            document.getElementById('ood-explainer').classList.remove('hidden');
+            document.getElementById('conf-wrapper').classList.add('hidden');
         } else {
             oodAlert.classList.add('hidden');
-            agregarAlLog(`Entropía: ${data.entropy.toFixed(3)} nats`, 'success');
+            agregarAlLog(`Entropía: ${calculatedEntropy.toFixed(3)} nats`, 'success');
+            
+            // Reset prediction card
+            predCard.style.opacity = '1';
+            document.getElementById('pred-label').style.fontSize = '';
+            document.getElementById('ood-explainer').classList.add('hidden');
+            document.getElementById('conf-wrapper').classList.remove('hidden');
         }
 
         setTimeout(() => {
@@ -213,20 +249,22 @@ document.addEventListener('DOMContentLoaded', () => {
         const confBar = document.getElementById('conf-bar');
         const confVal = document.getElementById('conf-val');
         
-        predLabel.textContent = data.class_label;
-        const confPct = (data.confidence * 100).toFixed(1);
-        confVal.textContent = `${confPct}%`;
-        confBar.style.width = `${confPct}%`;
-        
-        if (confPct > 80) {
-            predLabel.style.color = 'var(--color-green)';
-            confBar.style.background = 'var(--color-green)';
-        } else if (confPct > 50) {
-            predLabel.style.color = 'var(--color-yellow)';
-            confBar.style.background = 'var(--color-yellow)';
-        } else {
-            predLabel.style.color = 'var(--color-red)';
-            confBar.style.background = 'var(--color-red)';
+        if (!isOOD) {
+            predLabel.textContent = data.class_label;
+            const confPct = (data.confidence * 100).toFixed(1);
+            confVal.textContent = `${confPct}%`;
+            confBar.style.width = `${confPct}%`;
+            
+            if (confPct > 80) {
+                predLabel.style.color = 'var(--color-green)';
+                confBar.style.background = 'var(--color-green)';
+            } else if (confPct > 50) {
+                predLabel.style.color = 'var(--color-yellow)';
+                confBar.style.background = 'var(--color-yellow)';
+            } else {
+                predLabel.style.color = 'var(--color-red)';
+                confBar.style.background = 'var(--color-red)';
+            }
         }
 
         // Latency

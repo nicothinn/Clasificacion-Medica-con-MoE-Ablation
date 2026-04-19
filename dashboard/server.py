@@ -2,7 +2,7 @@ import os
 import io
 import base64
 from io import BytesIO
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 import numpy as np
@@ -43,7 +43,7 @@ def pil_to_base64(img):
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 @app.post("/api/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(file: UploadFile = File(...), source: str = Form("unknown")):
     global engine
     if engine is None:
         return JSONResponse(content={"success": False, "error": "Engine not initialized"}, status_code=500)
@@ -53,7 +53,7 @@ async def predict(file: UploadFile = File(...)):
     file_obj.name = file.filename
     
     try:
-        result = engine.run(file_obj)
+        result = engine.run(file_obj, source=source)
         
         response_data = {
             "success": True,
