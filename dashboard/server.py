@@ -2,7 +2,7 @@ import os
 import io
 import base64
 from io import BytesIO
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 import numpy as np
@@ -26,10 +26,12 @@ def read_root():
 engine = None
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     global engine
-    # Load with mock=True initially for fast startup
-    engine = MoEInferenceEngine(use_mock=True)
+    print("Initializing MoE Inference Engine...")
+    engine = MoEInferenceEngine(use_mock=False)
+    print("MoE Inference Engine initialized successfully.")
+
 
 def pil_to_base64(img):
     if img is None:
@@ -81,17 +83,7 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
 
-@app.post("/api/reload_engine")
-async def reload_engine(use_mock: bool = Form(...), repo_id: str = Form(None), token: str = Form(None)):
-    global engine
-    try:
-        engine = MoEInferenceEngine(use_mock=use_mock, repo_id=repo_id)
-        if token:
-            import moe_inference
-            moe_inference.HF_TOKEN = token
-        return {"success": True, "message": "Engine reloaded successfully."}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+
 
 if __name__ == "__main__":
     import uvicorn

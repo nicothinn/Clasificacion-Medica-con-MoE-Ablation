@@ -185,12 +185,9 @@ if "inference_history" not in st.session_state:
 #  Carga del motor de inferencia (cacheado)
 # ======================================================================
 @st.cache_resource
-def get_engine(use_mock=True, repo_id=None, token=None):
-    """Carga el motor MoE una sola vez (persistente entre recargas)."""
-    if token:
-        import moe_inference
-        moe_inference.HF_TOKEN = token
-    return MoEInferenceEngine(use_mock=use_mock, repo_id=repo_id)
+def get_engine():
+    """Carga el motor MoE real una sola vez (persistente entre recargas)."""
+    return MoEInferenceEngine(use_mock=False, repo_id="Lucu1232004p/Proyecto-MoE-Pesos")
 
 
 # ======================================================================
@@ -257,28 +254,8 @@ components.html(f"""
 #  Sidebar — Carga de archivo (#15)
 # ======================================================================
 with st.sidebar:
-    st.markdown("### Modo de Operacion")
-    use_mock = st.toggle(
-        "Modo Demo (Modelos Simulados)",
-        value=True,
-        help="Si se desactiva, el sistema intentara descargar los pesos reales de Hugging Face.",
-    )
+    engine = get_engine()
 
-    repo_id = None
-    hf_token = None
-    if not use_mock:
-        st.markdown("#### Hugging Face Hub")
-        repo_id = st.text_input("Repo ID", value="Lucu1232004p/Proyecto-MoE-Pesos",
-                                help="Usuario/Nombre-del-repo")
-        hf_token = st.text_input("HF Token (Opcional)", type="password",
-                                 help="Necesario si el repo es privado")
-        if st.button("Cargar Modelos Reales"):
-            st.cache_resource.clear()
-            st.rerun()
-
-    engine = get_engine(use_mock=use_mock, repo_id=repo_id, token=hf_token)
-
-    st.markdown("---")
     st.markdown("### Imagen Medica")
     st.markdown(
         "Sube una imagen **PNG/JPEG** (2D) o un volumen **NIfTI** (3D). "
@@ -292,14 +269,10 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("### Configuracion")
-    ood_threshold = st.slider(
-        "Umbral OOD (% entropia max)",
-        min_value=50, max_value=99, value=85,
-        help="Si la entropia del router supera este porcentaje, se activa la alerta OOD.",
-    )
 
-    st.markdown("---")
+    # OOD threshold — hardcoded optimal value
+    OOD_THRESHOLD = 85
+
     st.markdown("### Sesion")
     st.metric("Inferencias realizadas", st.session_state.total_inferences)
 
@@ -967,8 +940,8 @@ else:
             <li>Consulta el <strong>Load Balance</strong> para verificar la distribucion equitativa.</li>
         </ol>
         <p class="note">
-            Este dashboard opera en modo demo con modelos simulados.
-            Active los modelos reales desde el panel de configuracion.
+            Este dashboard conecta directamente con el repositorio de
+            Hugging Face para cargar los modelos reales del sistema MoE.
         </p>
     </div>
 

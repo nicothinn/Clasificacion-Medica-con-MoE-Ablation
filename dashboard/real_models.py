@@ -316,74 +316,30 @@ def build_vgg16_bn_expert(num_classes=5):
 
 class DCSwinBStyle3D(nn.Module):
     """
-    Experto 4 — LUNA16. Dual-branch (Swin2D adaptado a 3D + CNN 3D).
-    Usa gradient checkpointing obligatorio (consigna).
+    Experto 4 — LUNA16. R3D-18 con backbone envuelto en nn.Sequential.
+    
+    El checkpoint fue entrenado con:
+        base = r3d_18(weights=R3D_18_Weights.DEFAULT)
+        self.backbone = nn.Sequential(*list(base.children())[:-1])
+        self.head = nn.Linear(512, num_classes)
+    
+    Las keys del state_dict usan el prefijo 'backbone.X.Y' (Sequential wrapping)
+    y head.weight con shape [2, 512].
     """
 
     def __init__(self, num_classes=2):
         super().__init__()
-        # Rama Swin: tomar componentes de swin_tiny_2D
-        swin2d = timm.create_model(
-            "swin_tiny_patch4_window7_224",
-            pretrained=False,
-            num_classes=0,
-            img_size=256,
-        )
-        c_out = swin2d.patch_embed.proj.out_channels
-        self.patch_embed_3d = nn.Conv3d(
-            1, c_out, kernel_size=(4, 4, 4), stride=(4, 4, 4)
-        )
-        self.dw_mix = nn.Conv3d(
-            c_out, c_out, kernel_size=3, padding=1, groups=c_out
-        )
-        self.patch_embed_norm = swin2d.patch_embed.norm
-        self.layers = swin2d.layers
-        self.norm = swin2d.norm
-        self.swin_dim = swin2d.num_features
-
-        # Rama CNN 3D: basada en R3D-18
         base = r3d_18(weights=None)
-        self.cnn_branch = nn.Sequential(
-            nn.Conv3d(1, 64, kernel_size=(3, 7, 7), stride=(1, 2, 2),
-                      padding=(1, 3, 3), bias=False),
-            base.stem[1],
-            base.stem[2],
-            base.layer1,
-            base.layer2,
-            nn.AdaptiveAvgPool3d(1),
-            nn.Flatten(),
-        )
-        self.cnn_dim = 128
-
-        # Head de fusión
-        self.head = nn.Linear(self.swin_dim + self.cnn_dim, num_classes)
+        # Reproducir exactamente la estructura del notebook de entrenamiento:
+        # nn.Sequential(*list(base.children())[:-1]) excluye la última capa fc
+        self.backbone = nn.Sequential(*list(base.children())[:-1])
+        self.head = nn.Linear(512, num_classes)
 
     def forward(self, x):
         if x.ndim == 4:
             x = x.unsqueeze(0)
-
-        # Rama CNN
-        z_cnn = self.cnn_branch(x)
-
-        # Rama Swin adaptada a 3D
-        t = self.patch_embed_3d(x)
-        t = self.dw_mix(t)
-        b, c, d, h, w = t.shape
-        # Aplanar las dimensiones 3D a 2D para los layers de Swin
-        t = t.view(b, c, 4, 4, h, w) \
-             .permute(0, 1, 2, 4, 3, 5) \
-             .reshape(b, c, 4 * h, 4 * w) \
-             .permute(0, 2, 3, 1)
-        t = self.patch_embed_norm(t)
-
-        # Gradient checkpointing obligatorio para 3D
-        for layer in self.layers:
-            t = grad_checkpoint(layer, t, use_reentrant=False)
-
-        t = self.norm(t)
-        z_swin = t.mean(dim=[1, 2])
-
-        return self.head(torch.cat([z_swin, z_cnn], dim=1))
+        feat = self.backbone(x).flatten(1)
+        return self.head(feat)
 
 
 class R3D18Expert(nn.Module):

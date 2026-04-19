@@ -7,10 +7,10 @@
     <!-- Modern Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&family=Merriweather:wght@300;400;700&display=swap" rel="stylesheet">
     <!-- Icons (Lucide) -->
     <script src="https://unpkg.com/lucide@latest"></script>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
     <div class="app-container">
@@ -18,7 +18,7 @@
         <aside class="sidebar">
             <div class="sidebar-header">
                 <div class="logo-box">
-                    <i data-lucide="network"></i>
+                    <i data-lucide="brain" class="brain-icon"></i>
                 </div>
                 <div>
                     <h1>MoE Router</h1>
@@ -27,29 +27,6 @@
             </div>
 
             <div class="sidebar-content">
-                <div class="section-title">Modo de Operación</div>
-                <div class="toggle-group">
-                    <label class="switch">
-                        <input type="checkbox" id="mock-toggle" checked>
-                        <span class="slider round"></span>
-                    </label>
-                    <span class="toggle-label">Modo Demo (Simulado)</span>
-                </div>
-                <div class="info-text">Desactiva para usar modelos de Hugging Face reales.</div>
-
-                <div id="hf-settings" class="hidden">
-                    <div class="input-group">
-                        <label>Repo ID</label>
-                        <input type="text" id="repo-id" value="Lucu1232004p/Proyecto-MoE-Pesos">
-                    </div>
-                    <div class="input-group">
-                        <label>HF Token (Opcional)</label>
-                        <input type="password" id="hf-token" placeholder="huggingface_token...">
-                    </div>
-                    <button id="btn-reload" class="btn btn-secondary">Cargar Modelos Reales</button>
-                </div>
-
-                <div class="divider"></div>
 
                 <div class="section-title">Imagen Médica</div>
                 <div class="upload-zone" id="upload-zone">
@@ -59,16 +36,63 @@
                     <input type="file" id="file-input" accept=".png,.jpg,.jpeg,.nii,.nii.gz,.mha" hidden>
                 </div>
                 <div id="loading-indicator" class="hidden">
-                    <div class="spinner"></div>
-                    <p>Procesando inferencia...</p>
+                    <p class="loading-text">Analizando muestra anatómica...</p>
                 </div>
 
                 <div class="divider"></div>
+                
+                <div class="section-title">Arquitectura de Enrutamiento</div>
+                <div class="routing-diagram">
+                    <svg viewBox="0 0 200 130" width="100%" height="130" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <filter id="ink-bleed">
+                                <feTurbulence type="fractalNoise" baseFrequency="0.05" numOctaves="3" result="noise" />
+                                <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.5" xChannelSelector="R" yChannelSelector="G" />
+                            </filter>
+                        </defs>
+                        
+                        <!-- Lines -->
+                        <g class="routing-lines" stroke="#1F3330" stroke-width="1" stroke-dasharray="2,2" filter="url(#ink-bleed)">
+                            <path id="path-e0-base" d="M 100 35 L 30 95" />
+                            <path id="path-e1-base" d="M 100 35 L 65 95" />
+                            <path id="path-e2-base" d="M 100 35 L 100 95" />
+                            <path id="path-e3-base" d="M 100 35 L 135 95" />
+                            <path id="path-e4-base" d="M 100 35 L 170 95" />
+                        </g>
+                        
+                        <!-- Animated Active Line -->
+                        <path id="active-routing-path" d="" fill="none" stroke="#8B0000" stroke-width="2.5" filter="url(#ink-bleed)" class="routing-anim-path" />
 
-                <div class="section-title">Configuración</div>
-                <div class="slider-group">
-                    <label>Umbral OOD: <span id="ood-val">85</span>%</label>
-                    <input type="range" id="ood-slider" min="50" max="99" value="85">
+                        <!-- Nodes -->
+                        <g fill="#F4F1EA" stroke="#1F3330" stroke-width="1.5" filter="url(#ink-bleed)">
+                            <!-- Router -->
+                            <rect x="70" y="10" width="60" height="25" rx="3" />
+                            <text x="100" y="26" fill="#1F3330" font-family="'Outfit', serif" font-size="10" font-weight="700" text-anchor="middle" stroke="none" letter-spacing="1">ROUTER</text>
+                            
+                            <!-- Experts -->
+                            <circle cx="30" cy="95" r="12" id="node-e0" />
+                            <text x="30" y="99" fill="#1F3330" font-family="serif" font-size="10" font-weight="600" text-anchor="middle" stroke="none">E0</text>
+                            
+                            <circle cx="65" cy="95" r="12" id="node-e1" />
+                            <text x="65" y="99" fill="#1F3330" font-family="serif" font-size="10" font-weight="600" text-anchor="middle" stroke="none">E1</text>
+                            
+                            <circle cx="100" cy="95" r="12" id="node-e2" />
+                            <text x="100" y="99" fill="#1F3330" font-family="serif" font-size="10" font-weight="600" text-anchor="middle" stroke="none">E2</text>
+                            
+                            <circle cx="135" cy="95" r="12" id="node-e3" />
+                            <text x="135" y="99" fill="#1F3330" font-family="serif" font-size="10" font-weight="600" text-anchor="middle" stroke="none">E3</text>
+                            
+                            <circle cx="170" cy="95" r="12" id="node-e4" />
+                            <text x="170" y="99" fill="#1F3330" font-family="serif" font-size="10" font-weight="600" text-anchor="middle" stroke="none">E4</text>
+                        </g>
+                    </svg>
+                </div>
+
+                <div class="divider"></div>
+                
+                <div class="section-title">Bitácora del Sistema</div>
+                <div class="system-log" id="system-log">
+                    <!-- Logs inserted via JS -->
                 </div>
 
                 <div class="divider"></div>
@@ -126,7 +150,7 @@
                 <div class="grid-col span-4 stack">
                     <!-- Prediction -->
                     <div class="card pred-card" id="pred-card">
-                        <h3 class="card-title">Predicción Top-1</h3>
+                        <h3 class="card-title"><i data-lucide="activity"></i> Predicción Top-1</h3>
                         <div class="pred-value" id="pred-label">Melanoma</div>
                         <div class="conf-bar-wrapper">
                             <div class="conf-info">
@@ -166,7 +190,7 @@
                 </div>
 
                 <div class="grid-col span-6 card expert-details">
-                    <h3 class="card-title">Experto Activado</h3>
+                    <h3 class="card-title"><i data-lucide="cpu"></i> Experto Activado</h3>
                     <div class="expert-header">
                         <i data-lucide="cpu"></i>
                         <span id="expert-name">E1: ISIC 2019</span>
