@@ -1,19 +1,34 @@
 document.addEventListener('DOMContentLoaded', () => {
     // UI Elements
-    const mockToggle = document.getElementById('mock-toggle');
-    const hfSettings = document.getElementById('hf-settings');
-    const btnReload = document.getElementById('btn-reload');
-    const repoIdInput = document.getElementById('repo-id');
-    const hfTokenInput = document.getElementById('hf-token');
-    
     const uploadZone = document.getElementById('upload-zone');
     const fileInput = document.getElementById('file-input');
     const loadingIndicator = document.getElementById('loading-indicator');
     const emptyState = document.getElementById('empty-state');
     const resultsState = document.getElementById('results-state');
-    
-    const oodSlider = document.getElementById('ood-slider');
-    const oodVal = document.getElementById('ood-val');
+    const systemLog = document.getElementById('system-log');
+
+    function agregarAlLog(mensaje, type = 'info') {
+        if (!systemLog) return;
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString([], { hour12: false });
+        
+        const div = document.createElement('div');
+        div.className = `log-entry log-${type}`;
+        
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'log-time';
+        timeSpan.textContent = `[${timeStr}]`;
+        
+        const msgSpan = document.createElement('span');
+        msgSpan.className = 'log-msg';
+        msgSpan.textContent = ` ${mensaje}`;
+        
+        div.appendChild(timeSpan);
+        div.appendChild(msgSpan);
+        
+        systemLog.appendChild(div);
+        systemLog.scrollTop = systemLog.scrollHeight;
+    }
     
     const tabs = document.querySelectorAll('.tab-btn');
     const tabContents = document.querySelectorAll('.tab-content');
@@ -29,46 +44,8 @@ document.addEventListener('DOMContentLoaded', () => {
         "E4: Pancreas 3D"
     ];
 
-    // Toggle HF Settings
-    mockToggle.addEventListener('change', (e) => {
-        if (e.target.checked) {
-            hfSettings.classList.add('hidden');
-        } else {
-            hfSettings.classList.remove('hidden');
-        }
-    });
-
-    // Reload Engine
-    btnReload.addEventListener('click', async () => {
-        const btn = btnReload;
-        btn.textContent = "Cargando...";
-        btn.disabled = true;
-        
-        const formData = new FormData();
-        formData.append("use_mock", mockToggle.checked);
-        formData.append("repo_id", repoIdInput.value);
-        if(hfTokenInput.value) formData.append("token", hfTokenInput.value);
-
-        try {
-            const res = await fetch('/api/reload_engine', { method: 'POST', body: formData });
-            const data = await res.json();
-            if(data.success) {
-                alert("Motor recargado correctamente.");
-            } else {
-                alert("Error: " + data.error);
-            }
-        } catch (e) {
-            alert("Error de conexión");
-        } finally {
-            btn.textContent = "Cargar Modelos Reales";
-            btn.disabled = false;
-        }
-    });
-
-    // OOD Slider
-    oodSlider.addEventListener('input', (e) => {
-        oodVal.textContent = e.target.value;
-    });
+    // OOD Threshold — fixed at 85% of max entropy (calibrated value)
+    const UMBRAL_OOD_DEFAULT = 0.85;
 
     // Tabs
     tabs.forEach(tab => {
@@ -114,6 +91,13 @@ document.addEventListener('DOMContentLoaded', () => {
         uploadZone.classList.add('hidden');
         loadingIndicator.classList.remove('hidden');
 
+        systemLog.innerHTML = '';
+        const shortName = file.name.length > 25 ? file.name.substring(0, 22) + '...' : file.name;
+        agregarAlLog(`Archivo cargado: ${shortName}`, 'info');
+        setTimeout(() => {
+            agregarAlLog(`Extrayendo features ${file.name.toLowerCase().endsWith('.nii') || file.name.toLowerCase().endsWith('.nii.gz') || file.name.toLowerCase().endsWith('.mha') ? '3D' : '2D'}...`, 'info');
+        }, 300);
+
         const formData = new FormData();
         formData.append("file", file);
 
@@ -148,9 +132,46 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    const ROUTING_PATHS = [
+        "M 100 35 L 30 95",
+        "M 100 35 L 65 95",
+        "M 100 35 L 100 95",
+        "M 100 35 L 135 95",
+        "M 100 35 L 170 95"
+    ];
+
     function updateDashboard(data) {
         // Show results
         resultsState.classList.remove('hidden');
+
+        // Animate Routing Diagram
+        const activePath = document.getElementById('active-routing-path');
+        if (activePath) {
+            activePath.classList.remove('animate');
+            setTimeout(() => {
+                activePath.setAttribute('d', ROUTING_PATHS[data.expert_id]);
+                activePath.classList.add('animate');
+                
+                // Highlight active node
+                for (let i = 0; i < 5; i++) {
+                    const nodeCircle = document.getElementById(`node-e${i}`);
+                    if (nodeCircle) {
+                        const nodeText = nodeCircle.nextElementSibling;
+                        if (i === data.expert_id) {
+                            nodeText.style.fill = '#8B0000';
+                            nodeText.style.fontWeight = '700';
+                            nodeCircle.style.stroke = '#8B0000';
+                            nodeCircle.style.strokeWidth = '2.5';
+                        } else {
+                            nodeText.style.fill = '#1F3330';
+                            nodeText.style.fontWeight = '600';
+                            nodeCircle.style.stroke = '';
+                            nodeCircle.style.strokeWidth = '';
+                        }
+                    }
+                }
+            }, 50);
+        }
 
         // Images
         document.getElementById('img-original').src = "data:image/png;base64," + data.display_image;
@@ -163,19 +184,29 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('img-meta').textContent = 
             `${dimStr} | Original: ${data.original_shape.join('x')} | Adaptado: ${data.processed_shape.join('x')}`;
 
-        // OOD
+        // OOD — uses hardcoded threshold
         const oodAlert = document.getElementById('ood-alert');
-        // Check if user slider threshold overrides
-        const userThreshold = parseInt(oodSlider.value) / 100;
-        const isOOD = data.entropy > userThreshold;
+        const isOOD = data.entropy > UMBRAL_OOD_DEFAULT;
 
         if (isOOD) {
             oodAlert.classList.remove('hidden');
             document.getElementById('ood-details').textContent = 
-                `Entropía: ${data.entropy.toFixed(3)} nats • Umbral: ${userThreshold.toFixed(3)}`;
+                `Entropía: ${data.entropy.toFixed(3)} nats • Umbral: ${UMBRAL_OOD_DEFAULT.toFixed(3)}`;
+            agregarAlLog(`Entropía: ${data.entropy.toFixed(3)} nats (ALERTA OOD)`, 'error');
         } else {
             oodAlert.classList.add('hidden');
+            agregarAlLog(`Entropía: ${data.entropy.toFixed(3)} nats`, 'success');
         }
+
+        setTimeout(() => {
+            agregarAlLog(`Ruteo completado -> Experto ${data.expert_id}`, 'info');
+            agregarAlLog(`Inferencia en ${data.expert_arch}...`, 'info');
+        }, 500);
+
+        setTimeout(() => {
+            agregarAlLog(`Predicción: ${data.class_label} (${(data.confidence * 100).toFixed(1)}%)`, 'success');
+            agregarAlLog(`Latencia total: ${data.total_ms.toFixed(1)} ms`, 'warning');
+        }, 800);
 
         // Prediction
         const predLabel = document.getElementById('pred-label');

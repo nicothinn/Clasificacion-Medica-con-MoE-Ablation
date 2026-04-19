@@ -197,13 +197,18 @@ class MoEInferenceEngine:
         El SwitchablePatchEmbed acepta tensores sin batch dim,
         pero se lo añadimos por consistencia.
         """
+        t = tensor_raw.to(self.device)
         if is_3d:
             # 3D volumes: already in [0,1] from HU windowing, no extra norm
-            return tensor_raw.to(self.device)
+            if t.ndim == 4:
+                t = t.unsqueeze(0)
+            return t
         else:
             # 2D: El Router funciona mejor con el tensor crudo [0,1]
             # (ImageNet norm sobre radiografías distorsiona el CLS token y causa colapso a ISIC)
-            return tensor_raw.to(self.device)
+            if t.ndim == 3:
+                t = t.unsqueeze(0)
+            return t
 
     def _prepare_expert_tensor(self, tensor_raw, is_3d, expert_id):
         """
