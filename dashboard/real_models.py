@@ -214,70 +214,19 @@ class VisionRouter(nn.Module):
 # 2. Expertos Reales
 # =============================================================================
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block for LungMaxViT initial state."""
-    def __init__(self, in_channels, reduced_channels):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, reduced_channels, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(reduced_channels, in_channels, bias=False),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = x.view(b, c, -1).mean(dim=2)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y
+class SwinNIHClassifier(nn.Module):
+    """Experto 1 — NIH ChestX-ray. Swin-Tiny (notebook 05)."""
 
-class LungMaxViT(nn.Module):
-    """Experto 1 — NIH ChestX-ray14. LungMaxViT (MaxViT modificado)."""
-
-    def __init__(self, num_classes=14):
+    def __init__(self, num_classes=5, pretrained=False):
         super().__init__()
-        self.initial_block = nn.ModuleDict({
-            'conv1': nn.Sequential(
-                nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(32),
-                nn.GELU()
-            ),
-            'conv2': nn.Sequential(
-                nn.Conv2d(32, 64, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.BatchNorm2d(64),
-                nn.GELU()
-            ),
-            'conv3': nn.Sequential(
-                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-                nn.BatchNorm2d(64),
-                nn.GELU()
-            ),
-            'se': SEBlock(64, 16),
-            'proj': nn.Sequential(
-                nn.ConvTranspose2d(64, 3, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
-                nn.BatchNorm2d(3)
-            )
-        })
-        
-        self.maxvit = timm.create_model(
-            'maxvit_tiny_tf_224',
-            pretrained=False,
+        self.model = timm.create_model(
+            "swin_tiny_patch4_window7_224",
+            pretrained=pretrained,
             num_classes=num_classes,
         )
 
     def forward(self, x):
-        if x.ndim == 3:
-            x = x.unsqueeze(0)
-        if x.shape[1] == 1:
-            x = x.repeat(1, 3, 1, 1)
-            
-        t = self.initial_block['conv1'](x)
-        t = self.initial_block['conv2'](t)
-        t = self.initial_block['conv3'](t)
-        t = self.initial_block['se'](t)
-        t = self.initial_block['proj'](t)
-        
-        return self.maxvit(t)
+        return self.model(x)
 
 
 def build_efficientnet_b3_expert(num_classes=9):
@@ -297,8 +246,13 @@ def build_vgg16_bn_expert(num_classes=5):
     - Clasificador custom con BatchNorm y Dropout
     """
     model = models.vgg16_bn(weights=None)
-    # Adaptar primera conv para 1 canal
-    model.features[0] = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+    # Adaptar primera conv para 1 canal (igual que notebook 05)
+    old_conv = model.features[0]
+    new_conv = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+    with torch.no_grad():
+        new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True))
+        new_conv.bias.copy_(old_conv.bias)
+    model.features[0] = new_conv
     # Clasificador custom (del notebook)
     model.classifier = nn.Sequential(
         nn.Linear(512 * 7 * 7, 512),
@@ -314,49 +268,39 @@ def build_vgg16_bn_expert(num_classes=5):
     return model
 
 
-class DCSwinBStyle3D(nn.Module):
+class R3D18LunaKineticsExpert(nn.Module):
     """
-    Experto 4 — LUNA16. R3D-18 con backbone envuelto en nn.Sequential.
-    
-    El checkpoint fue entrenado con:
-        base = r3d_18(weights=R3D_18_Weights.DEFAULT)
-        self.backbone = nn.Sequential(*list(base.children())[:-1])
-        self.head = nn.Linear(512, num_classes)
-    
-    Las keys del state_dict usan el prefijo 'backbone.X.Y' (Sequential wrapping)
-    y head.weight con shape [2, 512].
+    Experto 4 — LUNA16. R3D-18 binario: 3 canales con stats Kinetics.
     """
 
-    def __init__(self, num_classes=2):
+    def __init__(self, num_classes=2, pretrained=False):
         super().__init__()
         base = r3d_18(weights=None)
-        # Reproducir exactamente la estructura del notebook de entrenamiento:
-        # nn.Sequential(*list(base.children())[:-1]) excluye la última capa fc
         self.backbone = nn.Sequential(*list(base.children())[:-1])
         self.head = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        if x.ndim == 4:
-            x = x.unsqueeze(0)
         feat = self.backbone(x).flatten(1)
         return self.head(feat)
 
 
 class R3D18Expert(nn.Module):
     """
-    Experto 5 — Pancreas. R3D-18 adaptado para 1 canal.
+    Experto 5 — Pancreas. R3D-18 con 3 canales de entrada.
     Usa gradient checkpointing obligatorio (consigna).
-    Estructura ajustada para coincidir con las keys del state_dict real.
+    
+    El checkpoint usa keys directas (stem, layer1..4, avgpool)
+    y un head secuencial con 128 unidades ocultas.
     """
 
     def __init__(self, num_classes=2):
         super().__init__()
         base = r3d_18(weights=None)
         
-        # El checkpoint fue entrenado con 3 canales de entrada (no 1),
-        # así que NO modificamos stem[0]; se mantiene la conv original [64, 3, 3, 7, 7].
+        # El checkpoint fue entrenado con 3 canales de entrada,
+        # así que NO modificamos stem[0].
         
-        # Atributos individuales para coincidir con keys del state_dict (sin prefijo backbone)
+        # Atributos individuales para coincidir con keys del state_dict
         self.stem = base.stem
         self.layer1 = base.layer1
         self.layer2 = base.layer2
@@ -364,7 +308,7 @@ class R3D18Expert(nn.Module):
         self.layer4 = base.layer4
         self.avgpool = base.avgpool
         
-        # Head reconstruida: el checkpoint usa 128 unidades ocultas (no 256)
+        # Head reconstruida: el checkpoint usa 128 unidades ocultas
         self.head = nn.Sequential(
             nn.Flatten(1),                  # 0
             nn.Linear(512, 128),           # 1 (weight, bias)
@@ -378,7 +322,7 @@ class R3D18Expert(nn.Module):
         if x.ndim == 4:
             x = x.unsqueeze(0)
 
-        # Gradient checkpointing obligatorio por bloque para optimizar memoria en 3D
+        # Gradient checkpointing obligatorio por bloque (consigna §8.1)
         x = grad_checkpoint(self.stem, x, use_reentrant=False)
         x = grad_checkpoint(self.layer1, x, use_reentrant=False)
         x = grad_checkpoint(self.layer2, x, use_reentrant=False)
