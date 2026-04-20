@@ -225,26 +225,31 @@ El sistema cuenta con una interfaz profesional desarrollada en **Streamlit** y u
 ### Requisitos previos
 1. Tener instalada la versión de **Python 3.10** o superior.
 2. Contar con una GPU compatible (opcional, pero recomendada para inferencia 3D).
-3. 
+   
 ### Pasos para iniciar el sistema
 1. **Navegar al directorio del dashboard:**
    ```bash
    cd dashboard
 
-# Configurar el entorno virtual (si no está creado):
-python -m venv venv
+2. **Configurar el entorno virtual (si no está creado):**
+   ```bash
+   python -m venv venv
 
-# En Windows:
-.\venv\Scripts\activate
+3. **En Windows:**
+   ```bash
+   .\venv\Scripts\activate
 
-# Instalar dependencias:
-pip install -r requirements.txt
+4. **Instalar dependencias:**
+   ```bash
+   pip install -r requirements.txt
 
-# Ejecutar servidor de inferencia:
-uvicorn server:app --reload
+5. **Ejecutar servidor de inferencia:**
+   ```bash
+   uvicorn server:app --reload
 
-# Lanzar la interfaz de usuario (Frontend): Abre otra terminal (manteniendo el servidor anterior encendido) y ejecuta:
-streamlit run app.py
+6. **Lanzar la interfaz de usuario (Frontend): Abre otra terminal (manteniendo el servidor anterior encendido) y ejecuta:**
+   ```bash
+   streamlit run app.py
 
 ---
 
