@@ -205,39 +205,46 @@ El dashboard cumple los items 15-22 de la consigna:
 
 | Funcionalidad | Descripcion |
 |---------------|-------------|
-| Carga de imagen | PNG, JPEG, NIfTI. Deteccion automatica 2D/3D. |
+| Carga de imagen | PNG, JPEG, NIfTI, MHA o pares MHD+RAW. Deteccion automatica 2D/3D. |
 | Preprocesado | Muestra dimensiones originales vs adaptadas. |
 | Inferencia | Etiqueta predicha, confianza, latencia en ms. |
+| Bitacora del sistema | Registro cronológico detallado que monitorea el flujo de la inferencia. |
+| Arquitectura de enrutamiento | Muestra el experto usado por el router para cada muestra. |
 | Attention Heatmap | Mapa de calor del router ViT sobre la imagen. |
 | Panel del experto | Nombre, arquitectura, dataset, gating score. |
 | Panel ablation | Tabla comparativa de los 4 metodos de routing. |
 | Load Balance | Grafica de barras con f_i acumulado y ratio. |
 | OOD Detection | Alerta cuando la entropia del gating supera umbral. |
 
+
+
 ### Como correrlo
+Ejecución del Dashboard Interactivo
+El sistema cuenta con una interfaz profesional desarrollada en **Streamlit** y un backend en **FastAPI** para la inferencia en tiempo real.
 
-**Opcion 1 — Streamlit (frontend interactivo):**
+### Requisitos previos
+1. Tener instalada la versión de **Python 3.10** o superior.
+2. Contar con una GPU compatible (opcional, pero recomendada para inferencia 3D).
+3. 
+### Pasos para iniciar el sistema
+1. **Navegar al directorio del dashboard:**
+   ```bash
+   cd dashboard
 
-```bash
-cd dashboard
+# Configurar el entorno virtual (si no está creado):
+python -m venv venv
+
+# En Windows:
+.\venv\Scripts\activate
+
+# Instalar dependencias:
 pip install -r requirements.txt
+
+# Ejecutar servidor de inferencia:
+uvicorn server:app --reload
+
+# Lanzar la interfaz de usuario (Frontend): Abre otra terminal (manteniendo el servidor anterior encendido) y ejecuta:
 streamlit run app.py
-```
-
-Se abre en `http://localhost:8501`.
-
-**Opcion 2 — FastAPI (backend API REST):**
-
-```bash
-cd dashboard
-uvicorn server:app --host 0.0.0.0 --port 8000
-```
-
-Endpoints disponibles en `http://localhost:8000/docs`.
-
-**Opcion 3 — Colab:**
-
-Ejecutar `app.py` en una celda de Colab con `!streamlit run app.py &` y usar el tunnel de Colab o `localtunnel` para acceder.
 
 ---
 
@@ -345,7 +352,7 @@ PROYECTO_MOE_VISION/
 
 | Router (extra, con feedback) | val_acc | ratio |
 |------------------------------|---------|-------|
-| ViT + SoftKNN (head_only) | **0.9483** | **1.13** |
+| ViT + SoftKNN (head_only) | **0.9472** | **1.277** |
 | ViT + Linear diferenciable | 0.9472-0.9494 | 1.25-1.29 |
 | ViT + NeuralGMM | 0.8169 (oscila) | 2.2-28.3 |
 | ViT + LogGaussianNB | 0.7270 -> 0.1955 | > 10^8 (colapso) |
