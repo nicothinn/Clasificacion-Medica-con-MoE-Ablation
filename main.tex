@@ -1,0 +1,381 @@
+\documentclass[conference]{IEEEtran}
+
+% Paquetes
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amsfonts}
+\usepackage{graphicx}
+% Requerido para \captionof{figure} en entornos center (expertos 3--5) y compatibilidad Overleaf
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{placeins}
+\usepackage{url}
+
+\title{Clasificación Médica Multimodal con Mixture of Experts \\ y Ablation Study del Router}
+
+\author{
+\IEEEauthorblockN{
+Andrés Alberto Enríquez (2222055),
+Nicolás Peña Irurita (2232049),
+Samuel Patiño Lucumí
+}
+\IEEEauthorblockA{
+Ingeniería de Datos e Inteligencia Artificial \\
+Universidad Autónoma de Occidente \\
+Cali, Colombia
+}
+}
+
+\raggedbottom
+\begin{document}
+
+% Lista de archivos gráficos referenciados (subir a Overleaf con estos nombres; \texttt{graphicx} admite PDF/PNG/JPG sin extensión):
+% \texttt{Router.jpeg}, \texttt{ratio.jpeg}, \texttt{ratio1.jpeg};
+% \texttt{ex1}, \texttt{ex1.1}, \texttt{ex2}, \texttt{ex2.2}, \texttt{ex3}, \texttt{ex3.3}, \texttt{ex4}, \texttt{ex4.4}, \texttt{ex5}, \texttt{ex5.5}.
+% Si Overleaf no encuentra un archivo, renombrar o añadir extensión explícita, p.\,ej.\ \texttt{\string\includegraphics\{ex1.png\}}.
+
+\maketitle
+
+\begin{abstract}
+Se presenta un sistema de \textit{Mixture of Experts} (MoE) para clasificación médica multimodal con cinco expertos heterogéneos (2D y 3D) coordinados por un \textit{router} sobre los embeddings CLS de un Vision Transformer (ViT-Tiny) \textbf{compartido entre dominios}: frente a entrenar un backbone completo por modalidad, una sola base común más un router ligero \textbf{escala mejor en número de parámetros} y evita duplicar millones de pesos innecesariamente. En el entrenamiento del MoE con \textbf{retroalimentación de los expertos} (pérdida de tarea y \textit{auxiliary loss} de Switch Transformer), el mejor mecanismo de routing fue \textbf{ViT+SoftKNN} (\textit{val\_acc} $0{,}9483$, mejor balance $\max(f_i)/\min(f_i)=1{,}13$). Paralelamente se ejecutó el \textit{ablation study} formal de la consigna sobre embeddings fijos: \textbf{ViT+k\textendash NN} (FAISS) ganó con \textit{routing accuracy} $0{,}9629$ y \textit{score} $0{,}9521$ frente a Linear, GMM y Naive Bayes. Se documentan además cabezas diferenciables extra (NeuralGMM, LogGaussianNB, KAN). Cuatro de los cinco expertos superan los umbrales F1 de la consigna y el balance del MoE cumple $\max/\min < 1{,}30$.
+\end{abstract}
+
+%================================================================
+\section{Introducción}
+%================================================================
+
+En la práctica clínica conviven modalidades muy distintas (radiografía, dermatoscopía, TAC volumétrica) cuya naturaleza estadística difiere lo suficiente para que un único modelo sufra una caída sistemática de desempeño. La asignación errónea de modalidad al experto degrada el sistema completo, no solo la métrica del modelo involucrado.
+
+La pregunta científica central planteada por el proyecto es: \textit{¿justifica un Vision Transformer su costo computacional como router frente a métodos estadísticos clásicos (GMM, Naive Bayes, k\textendash NN) que operan sobre los mismos embeddings?}
+
+La contribución del equipo cubre los seis objetivos de la consigna ---ViT como router, tres routers estadísticos baseline, ablation formal, sistema MoE end-to-end, expertos heterogéneos y \textit{auxiliary loss} de Switch Transformer--- y añade un experimento extra sugerido en sesión por el profesor de Analítica: \textbf{cabezas estadísticas diferenciables} (Neural GMM, LogGaussian Naive Bayes, SoftKNN) y una cabeza \textbf{Kolmogorov-Arnold} (KAN), entrenadas por gradiente sobre el mismo espacio latente.
+
+%================================================================
+\section{Arquitectura Propuesta}
+%================================================================
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=\columnwidth, height=0.32\textheight, keepaspectratio]{Router.jpeg}
+    \caption{Arquitectura del sistema MoE: preprocesador adaptativo 2D/3D, backbone ViT-Tiny compartido, router con cabeza intercambiable y cinco expertos especializados.}
+    \label{fig:moe_completa}
+\end{figure}
+
+\subsection*{A. Preprocesador adaptativo}
+El módulo \texttt{AdaptivePreprocessor} detecta automáticamente la dimensionalidad de la entrada sin metadatos clínicos. Las imágenes 2D se llevan a $224\times 224$ con normalización ImageNet (CLAHE adaptativo en NIH y Osteoartritis para realzar contraste); los volúmenes 3D se resamplean a 1\,mm isotrópico, se aplica \textit{windowing} HU $[-1000, 400]\to[0,1]$ y se llevan a $64^{3}$ vóxeles; para alimentar a los expertos pre-entrenados en Kinetics-400 se replican a 3 canales con la normalización oficial.
+
+\subsection*{B. Backbone compartido y \textit{router}}
+El \texttt{SwitchablePatchEmbed} aplica \texttt{patch\_embed\_2d} o \texttt{patch\_embed\_3d}, ambos proyectando a $\text{embed\_dim}=192$. Una secuencia única (CLS + patches + posición aprendible) atraviesa un ViT-Tiny y produce un CLS $h \in \mathbb{R}^{192}$. Sobre este CLS operan los cuatro routers del ablation obligatorio. Para el ablation extra, un \texttt{RouterProjector} lineal mapea $h \to z \in \mathbb{R}^{64}$ y la cabeza diferenciable trabaja sobre $z$.
+
+\subsection*{C. Justificación de los cinco expertos}
+La heterogeneidad arquitectónica (Tabla~\ref{tab:expertos_arq}) refleja la heterogeneidad del dato: 2D natural $\to$ CNN o Transformer jerárquico; volumen 3D $\to$ red 3D pre-entrenada en video; multietiqueta $\to$ pérdida asimétrica; binario clínico desbalanceado $\to$ Focal Loss con $\gamma$ alto.
+
+\begin{table}[H]
+\centering
+\caption{Expertos del sistema y justificación arquitectónica.}
+\label{tab:expertos_arq}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Exp.} & \textbf{Dataset} & \textbf{Modelo} & \textbf{Pérdida} \\ \midrule
+1 & NIH ChestX-ray14 (5 cls) & Swin-Tiny 224 & ASL ($\gamma_-{=}4$) \\
+2 & ISIC 2019 (8 cls) & EfficientNet-B3 & Focal $\gamma{=}2$ \\
+3 & Osteoartritis KL (5 cls) & VGG-16 BN & Focal $\gamma{=}2$ \\
+4 & LUNA16 CT 3D (binario) & R3D-18 (Kinetics) & Focal $\gamma{=}2$ \\
+5 & Páncreas CT 3D (binario) & R3D-18 (Kinetics) & Focal $\gamma{=}3$ \\ \bottomrule
+\end{tabular}
+\end{table}
+
+Swin-Tiny captura dependencias jerárquicas con coste lineal en NIH multietiqueta; EfficientNet-B3 ofrece la mejor relación parámetros/precisión sobre dermatoscopía; VGG-16 BN demostró empíricamente la mejor sensibilidad a osteofitos sutiles tras CLAHE; R3D-18 con \textit{gradient checkpointing} es obligatorio en 3D para caber en una GPU de $\sim$15\,GB.
+
+%================================================================
+\section{Ablation Study del Router}
+%================================================================
+
+\subsection{Ablation obligatorio (consigna): cuatro mecanismos}
+
+Se cumplió íntegramente el experimento descrito en la consigna: extraer los CLS tokens del ViT pre-entrenado y comparar cuatro mecanismos de decisión sobre el mismo $z$:
+
+\begin{itemize}
+    \item \textbf{ViT + Linear (Softmax)}: baseline de \textit{deep learning}, entrenado por SGD con \textit{auxiliary loss} (\textit{grid} de $lr$ y $\alpha$).
+    \item \textbf{ViT + GMM}: ajuste por EM (\texttt{sklearn.GaussianMixture}, \textit{grid} de \texttt{covariance\_type}, \texttt{reg\_covar}, \texttt{n\_init}).
+    \item \textbf{ViT + Naive Bayes}: estimación MLE analítica (\texttt{sklearn.GaussianNB}, \textit{grid} de \texttt{var\_smoothing}).
+    \item \textbf{ViT + k\textendash NN}: FAISS + PCA, \textit{grid} de \texttt{n\_components} y $k$.
+\end{itemize}
+
+El criterio de selección es el \textit{score} compuesto $\text{val\_acc} - 0{,}02\cdot\max(0,\text{val\_ratio}-1{,}30)$, idéntico al usado por el router DL. Los resultados óptimos por método aparecen en la Tabla~\ref{tab:ablation_consigna}.
+
+\begin{table}[H]
+\centering
+\caption{Ablation obligatorio: mejor configuración por método sobre el mismo CLS.}
+\label{tab:ablation_consigna}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Router} & \textbf{Routing Acc.} & \textbf{Ratio} & \textbf{Score} \\ \midrule
+ViT + k\textendash NN (FAISS, PCA=96, $k{=}3$) & \textbf{0{,}9629} & 1{,}839 & \textbf{0{,}9521} \\
+ViT + Linear (Softmax)                          & 0{,}8326          & 2{,}241 & 0{,}8138          \\
+ViT + Naive Bayes                                & 0{,}8202          & 2{,}438 & 0{,}7975          \\
+ViT + GMM (diag, reg=$10^{-3}$)                  & 0{,}8011          & 2{,}027 & 0{,}7866          \\ \bottomrule
+\end{tabular}
+\end{table}
+
+La latencia por inferencia, medida sobre el mismo lote de validación, es $\sim$8\,ms para Linear (forward del ViT + capa lineal), $\sim$3\,ms para GMM, $\sim$1\,ms para Naive Bayes y $\sim$2\,ms para k\textendash NN sobre FAISS; el cuello de botella en los cuatro casos es el ViT, no la cabeza.
+
+\subsection{Discusión: ¿qué método ganó y por qué?}
+
+El ganador del ablation obligatorio es \textbf{ViT+k\textendash NN}, con $\sim$13 puntos de \textit{routing accuracy} por encima del baseline lineal y un \textit{score} compuesto de $0{,}9521$. La razón es geométrica: el espacio CLS del ViT-Tiny pre-entrenado ya organiza las cinco modalidades en \textit{clusters} bien separables, por lo que un criterio basado en proximidad euclídea/coseno explota directamente esa estructura sin imponer supuestos distribucionales. Los métodos paramétricos Gaussianos (GMM, Naive Bayes) sufren al asumir independencia de dimensiones o componentes Gaussianas en un espacio profundo donde esos supuestos no se cumplen. El baseline lineal queda intermedio: aprende hiperplanos correctos pero no aprovecha la estructura local de los \textit{clusters}.
+
+\textbf{La hipótesis inicial se refuta:} no fue el ViT+Linear con gradiente quien ganó, sino el método más simple y no paramétrico. \textit{La calidad del embedding pesa más que la complejidad del clasificador.}
+
+\subsection{Curva de evolución del ViT+Linear}
+Las curvas del ViT+Linear durante el entrenamiento se reportan junto al balance en la Sección~V (Figs.~\ref{fig:loadbalance}--\ref{fig:loadbalance_ratio}); se observa convergencia estable de \textit{routing accuracy} en $\sim$80--100 épocas y descenso del ratio $f_{\max}/f_{\min}$ hacia $\le 1{,}30$ tras la calibración de $\alpha_{aux}$.
+
+\subsection{Extra (más allá de la consigna): cabezas diferenciables y KAN}
+
+Como mejora opcional sugerida por el profesor de Analítica, implementamos versiones \textbf{diferenciables} de las tres cabezas estadísticas y una cabeza \textbf{Kolmogorov-Arnold} (KAN, FastKAN), entrenadas \textbf{por gradiente} sobre el mismo $z\in\mathbb{R}^{64}$ (Tabla~\ref{tab:ablation_extra}):
+
+\begin{itemize}
+    \item \textbf{NeuralGMM}: $\mu_c, \sigma_c, \log\pi_c$ aprendibles, $\text{logit}_c = \log\pi_c + \log\mathcal{N}(z\mid\mu_c, \mathrm{diag}(\sigma_c^2))$.
+    \item \textbf{LogGaussianNB}: misma forma operativa, inicializada con estadísticos empíricos por clase.
+    \item \textbf{SoftKNN}: prototipo $p_c$ aprendible y temperatura $\tau$, $\text{logit}_c = -\|z-p_c\|^2/\tau$ (Prototypical Networks).
+    \item \textbf{KAN (FastKAN)}: $\text{Linear}(192{\to}128){+}\text{BN}{+}\text{ReLU}\to\text{FastKAN}([128,64])\to\text{Dropout}\to\text{Linear}(64{\to}5)$.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Ablation extra: cabezas diferenciables sobre el mismo $z$.}
+\label{tab:ablation_extra}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Router (extra)} & \textbf{val\_acc} & \textbf{ratio} \\ \midrule
+ViT + SoftKNN (head\_only)            & \textbf{0{,}9483} & \textbf{1{,}13} \\
+ViT + Linear diferenciable            & 0{,}9472 -- 0{,}9494 & 1{,}25 -- 1{,}29 \\
+ViT + NeuralGMM                       & 0{,}8169 (oscila)   & 2{,}2 -- 28{,}3 \\
+ViT + LogGaussianNB                   & 0{,}7270 $\to$ 0{,}1955 & $> 10^{8}$ (colapso) \\
+ViT + KAN (FastKAN)                   & 0{,}15 -- 0{,}21$^{*}$ & 439 -- 593$^{*}$ \\ \bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize $^{*}$Artefacto de validación por desalineación del cache de embeddings; el \textit{train\_acc} alcanza $0{,}95$.}
+\end{table}
+
+El ganador del ablation extra es \textbf{ViT+SoftKNN}, que reproduce la misma intuición geométrica del k\textendash NN del ablation obligatorio (proximidad a prototipos en espacio aprendido) pero con prototipos diferenciables, alcanzando además \textbf{el mejor balance de carga de todo el estudio} (ratio $1{,}13$). NeuralGMM y LogGaussianNB colapsan: sus varianzas $\sigma_c$ se contraen sobre las clases mayoritarias y un único experto absorbe el tráfico bajo el mismo presupuesto de $\alpha_{aux}$. La cabeza KAN converge en entrenamiento pero su validación está afectada por un cache CLS desalineado; documentamos el caso como resultado negativo.
+
+\textbf{Lectura conjunta:} en ambos ablation (obligatorio y extra) ganan los métodos basados en distancia/proximidad sobre los embeddings (\textbf{k\textendash NN} en el primero, \textbf{SoftKNN} en el segundo). La ganancia de complejidad del ViT como router está en el \textbf{backbone}, no en la cabeza.
+
+%================================================================
+\section{Resultados de Clasificación}
+%================================================================
+
+Cada experto se entrenó en \textbf{dos fases} (A: \textit{feature extraction}; B: \textit{fine-tuning} parcial o total) salvo NIH que añade una fase intermedia de cabeza. La Tabla~\ref{tab:f1_expertos} sintetiza el F1-Macro frente al umbral de la consigna.
+
+\begin{table}[H]
+\centering
+\caption{F1-Macro por experto (mejor checkpoint de validación) frente a umbral de la consigna.}
+\label{tab:f1_expertos}
+\begin{tabular}{@{}clccc@{}}
+\toprule
+\textbf{Exp.} & \textbf{Dataset} & \textbf{F1-Macro} & \textbf{Umbral} & \textbf{Cumple} \\ \midrule
+1 & NIH ChestX-ray14 & 0,6063 & $>$0,72 & No \\
+2 & ISIC 2019        & 0,7395 & $>$0,72 & Sí \\
+3 & Osteoartritis    & 0,8176 & $>$0,72 & Sí \\
+4 & LUNA16 (3D)      & 0,6620 & $>$0,65 & Sí \\
+5 & Páncreas (3D)    & 0,6937 & $>$0,65 & Sí \\ \bottomrule
+\end{tabular}
+\end{table}
+
+Cuatro de cinco expertos cumplen el umbral. NIH es el único que no alcanza 0,72 (se queda en 0,61) por la combinación multietiqueta + ruido de etiquetas + prevalencia muy baja de algunas patologías; la literatura reporta rangos $0{,}55$--$0{,}65$ para subconjuntos comparables.
+
+%==================== EXPERTO 1 ====================
+\subsection{Experto 1 -- NIH ChestX-ray14 (Swin-Tiny, F1 = 0,61)}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{ex1}
+\includegraphics[width=\linewidth]{ex1.1}
+\caption{Experto 1: (a) curva de entrenamiento, (b) matriz de confusión.}
+\label{fig:exp1}
+\end{figure}
+
+Tres fases (10 ép. backbone, 10 ép. cabeza, hasta 80 ép. \textit{fine-tuning} con \textit{early stopping}) sobre 5 patologías y \textit{split} por paciente. Pérdida ASL ($\gamma_-{=}4$, $\gamma_+{=}0$) + AdamW $lr=10^{-4}$. Es el experto con menor F1 del sistema; principal cuello de botella de clasificación.
+
+\FloatBarrier
+
+%==================== EXPERTO 2 ====================
+\subsection{Experto 2 -- ISIC 2019 (EfficientNet-B3, F1 = 0,74)}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\linewidth]{ex2} \\[0.1cm]
+    \small{(a) Matriz de confusión.}
+
+    \vspace{0.4cm}
+    \includegraphics[width=0.95\linewidth]{ex2.2} \\[0.1cm]
+    \small{(b) Curva de entrenamiento.}
+    \caption{Resultados del Experto 2.}
+    \label{fig:experto2_final}
+\end{figure}
+
+Dos fases (5 ép. \textit{feature extraction} con $lr{=}10^{-3}$; 30 ép. \textit{fine-tuning} con $lr{=}3{\times}10^{-4}$ y 3 últimos bloques desbloqueados). Focal Loss $\gamma{=}2$ + \texttt{WeightedRandomSampler}, AMP. Cumple el umbral.
+
+\FloatBarrier
+
+%==================== EXPERTO 3 ====================
+\subsection{Experto 3 -- Osteoartritis KL (VGG-16 BN, F1 = 0,82)}
+
+\begin{center}
+    \includegraphics[width=0.7\linewidth]{ex3} \\[0.05cm]
+    \small{(a) Curvas de entrenamiento.}
+
+    \vspace{0.3cm}
+    \includegraphics[width=0.75\linewidth]{ex3.3} \\[0.05cm]
+    \small{(b) Matriz de confusión.}
+    \captionof{figure}{Resultados del Experto 3.}
+    \label{fig:experto3_final}
+\end{center}
+
+Dos fases (10 ép. clasificador; 30 ép. \textit{fine-tuning}). CLAHE adaptativo + Focal Loss con pesos por clase. Mejor F1 del sistema (0,8176).
+
+\FloatBarrier
+
+%==================== EXPERTO 4 ====================
+\subsection{Experto 4 -- LUNA16 CT 3D (R3D-18, F1 = 0,66)}
+
+\begin{center}
+    \includegraphics[width=0.75\linewidth]{ex4} \\[0.05cm]
+    \small{(a) Curvas de entrenamiento.}
+
+    \vspace{0.3cm}
+    \includegraphics[width=0.75\linewidth]{ex4.4} \\[0.05cm]
+    \small{(b) Matriz de confusión.}
+    \captionof{figure}{Desempeño del Experto 4.}
+    \label{fig:exp4}
+\end{center}
+
+\textit{StratifiedGroupKFold} por \texttt{seriesuid} (sin fuga entre series). Dos fases por fold (8 ép. cabeza + 42 ép. \textit{fine-tuning} con LR diferenciados y \textit{cosine annealing}). Mejor fold: F1=0,6620 (cumple umbral 3D).
+
+\FloatBarrier
+
+%==================== EXPERTO 5 ====================
+\subsection{Experto 5 -- Páncreas CT 3D (R3D-18, F1 = 0,69)}
+
+\begin{center}
+    \includegraphics[width=0.75\linewidth]{ex5} \\[0.05cm]
+    \small{(a) Matriz de confusión.}
+
+    \vspace{0.3cm}
+    \includegraphics[width=0.75\linewidth]{ex5.5} \\[0.05cm]
+    \small{(b) Curva de entrenamiento.}
+    \captionof{figure}{Desempeño del Experto 5.}
+    \label{fig:exp5}
+\end{center}
+
+Dos fases (10 ép. cabeza con $lr{=}3{\times}10^{-3}$; 40 ép. \textit{full unfreeze} con $lr{=}2{\times}10^{-5}$). Focal Loss $\gamma{=}3$ por la severidad clínica de los falsos negativos PDAC. \textit{Gradient checkpointing} obligatorio. F1=0,6937 sobre $\sim$250 volúmenes.
+
+\FloatBarrier
+
+%================================================================
+\section{Balance de Carga}
+%================================================================
+
+Se implementó la \textit{auxiliary loss} de Switch Transformer:
+\begin{equation}
+\mathcal{L}_{aux} = N \cdot \sum_{i=1}^{N} f_i \cdot P_i,
+\end{equation}
+donde $f_i$ es la fracción de muestras enrutadas al experto $i$ y $P_i$ la probabilidad media asignada. El coeficiente $\alpha_{aux}$ se calibró empíricamente en el rango $[0{,}01,\,0{,}10]$ recomendado por la consigna: $\alpha_{aux}=0{,}01$ basta para el ViT+Linear; el SoftKNN extra requiere $0{,}10$ en \textit{head\_only} para acelerar el balance y se baja a $0{,}04$ en \textit{partial\_unfreeze}. Con $\alpha_{aux} < 0{,}01$ las cabezas Gaussianas diferenciables colapsan; con $> 0{,}15$ el routing pierde \textit{accuracy}.
+
+% Rutas de figuras alineadas con \texttt{main (1).tex}: subir los archivos a la raíz del proyecto en Overleaf.
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{ratio.jpeg}
+\caption{Balance de carga: fracciones $f_i$ por experto durante el entrenamiento del router.}
+\label{fig:loadbalance}
+\end{figure}
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{ratio1.jpeg}
+\caption{Balance de carga: evolución del cociente $\max(f_i)/\min(f_i)$ (objetivo $\leq 1{,}30$).}
+\label{fig:loadbalance_ratio}
+\end{figure}
+
+Tras las primeras épocas el cociente desciende y se estabiliza en $\approx 1{,}21$, por debajo del umbral $1{,}30$ exigido. El SoftKNN diferenciable logra el mejor balance del estudio ($1{,}13$).
+
+%================================================================
+\section{Alcances y Limitaciones}
+%================================================================
+
+\subsection*{Lo que funciona bien y por qué}
+Se cumplieron los seis objetivos de la consigna: ViT como router, tres routers estadísticos baseline, ablation formal con \textit{routing accuracy}, sistema MoE end-to-end, expertos heterogéneos y \textit{auxiliary loss} calibrada. Cuatro de cinco expertos superan los umbrales F1, el balance del MoE final cumple $\max/\min<1{,}30$ y el ablation revela que el k\textendash NN sobre FAISS supera a los baselines paramétricos. El extra (cabezas diferenciables) consolida el hallazgo: SoftKNN gana también en su categoría.
+
+\subsection*{Lo que no funcionó como se esperaba}
+\textbf{NIH no alcanza el umbral} F1=0,72 por la combinación multietiqueta + ruido de etiquetas + prevalencia desigual; es una limitación del experto, no del router. \textbf{NeuralGMM y LogGaussianNB diferenciables colapsan}: con $\alpha_{aux}$ bajo y \textit{partial unfreeze} prematuro, sus varianzas se contraen sobre las clases mayoritarias y un único experto absorbe el \textit{gating}. \textbf{La cabeza KAN} muestra \textit{train\_acc}$\sim 0{,}95$ pero \textit{val\_acc}$\sim 0{,}15$ por desalineación del cache CLS de validación; el modelo en realidad converge, pero la métrica mide un universo distinto. \textbf{Confusión Experto~1 $\leftrightarrow$ Experto~3} (NIH vs Osteo): ambos son radiografías 2D en escala de grises con texturas similares; se mitigó con CLAHE y filtrado por entropía del \textit{gating}, sin eliminarse por completo.
+
+\subsection*{Limitaciones de hardware}
+Una sola GPU (12--16 GB VRAM en entornos educativos), datos en Google Drive: la \textbf{descompresión inicial de los datasets toma $\sim$1,5 horas}, la normalización (CLAHE, HU clipping, resampling 3D) consume horas adicionales y \textbf{cada época del router en el batch mixto cuesta 40--60 minutos} (forward de ViT + cinco expertos congelados + validación + checkpoint). En 3D el \textit{gradient checkpointing} es obligatorio. La consecuencia es menor exploración de hiperparámetros y menos semillas por configuración.
+
+\subsection*{Limitaciones del dataset}
+NIH tiene $\sim$112\,K imágenes pero etiquetas muy ruidosas y desbalance fuerte; al filtrar a 5 patologías el corpus útil se reduce. Los datasets 3D (LUNA16, Páncreas) son pequeños, lo que aumenta la varianza entre folds y limita el F1 alcanzable. La mezcla 2D/3D obliga a muestreo proporcional para que el router no se sesgue al dominio mayoritario.
+
+\subsection*{Qué haríamos con más tiempo y recursos}
+(i) Repetir el ablation con varias semillas y reportar promedios $\pm$ desviación; (ii) regenerar el cache CLS alineado y cerrar el experimento KAN extra; (iii) entrenar NIH con tuning agresivo de umbrales por clase y considerar 14 patologías; (iv) ajustar finamente $\alpha_{aux}$ para el MoE end-to-end manteniendo el router ganador; (v) migrar a infraestructura con GPU mayor y datos en SSD local para reducir el ciclo de iteración.
+
+%================================================================
+\section{Conclusiones}
+%================================================================
+
+En el entrenamiento del MoE con \textbf{retroalimentación de los expertos} (flujo profesor: $\mathcal{L}_{\text{routing}} + \mathcal{L}_{\text{task}}$ con expertos activos y $\mathcal{L}_{aux}$ de Switch Transformer), el mejor mecanismo de routing fue \textbf{ViT+SoftKNN}: \textit{val\_acc} $0{,}9483$ y el mejor balance de carga del estudio ($\max(f_i)/\min(f_i)=1{,}13$), por delante del lineal y de las cabezas paramétricas diferenciables (NeuralGMM, LogGaussianNB) y de la cabeza KAN en las condiciones reportadas.
+
+La pregunta científica de la consigna se responde en dos niveles. Sobre \textbf{embeddings CLS fijos} (ablation obligatorio sin ese bucle de tarea), el ganador fue \textbf{ViT+k\textendash NN} (FAISS) con \textit{routing accuracy} $0{,}9629$ y \textit{score} $0{,}9521$. En ambos escenarios, la intuición es la misma: el ViT-Tiny pre-entrenado organiza los dominios en el espacio de representación, por lo que decisiones basadas en \textbf{proximidad} superan a supuestos Gaussianos rígidos sobre el vector.
+
+En cuanto al costo del ViT frente a ``un modelo por dominio'', la respuesta es \textbf{sí, compensa} usar \textbf{una sola base compartida} (backbone + preprocesador unificado) para tantos dominios: el número de parámetros \textbf{no escala linealmente} con el número de modalidades como si se entrenara o desplegara un transformador completo independiente por dataset. El router y su cabeza suman un orden de magnitud muy inferior al de repetir backbones; la especialización costosa queda en los expertos, mientras el espacio común se aprende una vez. Así se obtiene un sistema multimodal más \textbf{parco en parámetros} y más simple de mantener que $N$ pipelines duplicados.
+
+Para trabajos futuros, conviene \textbf{priorizar} una representación sólida (preprocesador adaptativo + ViT + warm-up) y un router de baja complejidad que explote esa geometría; los resultados negativos (colapso de GMM/NB diferenciables, métricas de validación no fiables en KAN por cache desalineado, NIH bajo umbral de F1) indican dónde \textbf{no} compensa dedicar la mayor parte del esfuerzo de ingeniería.
+
+%================================================================
+
+
+\begin{thebibliography}{00}
+
+% Papers Fundamentales de MoE y Transformers
+\bibitem{b1} Fedus, W., Zoph, B., \& Shazeer, N. (2021). ``Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.'' \textit{Journal of Machine Learning Research}, vol. 23, pp. 1--39.
+
+\bibitem{b2} Jacobs, R. A., Jordan, M. I., Nowlan, S. J., \& Hinton, G. E. (1991). ``Adaptive Mixtures of Local Experts.'' \textit{Neural Computation}, vol. 3, no. 1, pp. 79--87.
+
+\bibitem{b3} Dosovitskiy, A., Beyer, L., Kolesnikov, A., Weissenborn, D., Zhai, X., Unterthiner, T., et al. (2020). ``An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale.'' \textit{International Conference on Learning Representations (ICLR 2021)}.
+
+\bibitem{b4} Hihn, H., \& Braun, D. A. (2024). ``Mixture of Experts for Image Classification: What's the Sweet Spot?'' \textit{arXiv preprint arXiv:2411.18322}.
+
+\bibitem{b5} Liu, Z., Lin, Y., Cao, Y., Hu, H., Wei, Y., Zhang, Z., Lin, S., \& Guo, B. (2021). ``Swin Transformer: Hierarchical Vision Transformer using Shifted Windows.'' \textit{IEEE/CVF International Conference on Computer Vision (ICCV)}, pp. 10012--10022.
+
+% Arquitecturas de Expertos
+\bibitem{b6} Tan, M., \& Le, Q. V. (2019). ``EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks.'' \textit{Proceedings of the 36th International Conference on Machine Learning (ICML)}, pp. 6105--6114.
+
+\bibitem{b7} Simonyan, K., \& Zisserman, A. (2014). ``Very Deep Convolutional Networks for Large-Scale Image Recognition.'' \textit{arXiv preprint arXiv:1409.1556}.
+
+\bibitem{b8} Hara, K., Kataoka, H., \& Satoh, Y. (2018). ``Can Spatiotemporal 3D CNNs Retrace the History of 2D CNNs and ImageNet?'' \textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, pp. 6546--6555.
+
+% Preprocesamiento y Técnicas Médicas
+\bibitem{b9} Li, J., Wang, Y., \& Zhang, X. (2024). ``Contrast Limited Adaptive Local Histogram Equalization Method for Poor Contrast Image Enhancement.'' \textit{IEEE Xplore Digital Library}, doi: 10.1109/ACCESS.2024.10955260.
+
+\bibitem{b10} Singh, R., Singh, K., \& Kumar, S. (2024). ``Medical X-Ray Image Enhancement Using Global Contrast-Limited Adaptive Histogram Equalization.'' \textit{Applied Sciences}, vol. 13, no. 19, p. 11452.
+
+% Datasets Médicos
+\bibitem{b11} Wang, X., Peng, Y., Lu, L., Lu, Z., Bagheri, M., \& Summers, R. M. (2017). ``ChestX-ray8: Hospital-scale Chest X-ray Database and Benchmarks on Weakly-Supervised Classification and Localization of Common Thorax Diseases.'' \textit{IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, pp. 2097--2106.
+
+\bibitem{b12} Combalia, M., Codella, N. C., Rotemberg, V., Helba, B., Vilaplana, V., Reiter, O., et al. (2019). ``BCN20000: Dermoscopic Lesions in the Wild.'' \textit{arXiv preprint arXiv:1908.02288}. ISIC 2019 Challenge Dataset.
+
+\bibitem{b13} Setio, A. A. A., Traverso, A., de Bel, T., Berens, M. S., van den Bogaard, C., Cerello, P., et al. (2017). ``Validation, comparison, and combination of algorithms for automatic detection of pulmonary nodules in computed tomography images: The LUNA16 challenge.'' \textit{Medical Image Analysis}, vol. 42, pp. 1--13.
+
+\bibitem{b14} Roth, H. R., Lu, L., Farag, A., Shin, H.-C., Liu, J., Turkbey, E. B., \& Summers, R. M. (2015). ``DeepOrgan: Multi-level Deep Convolutional Networks for Automated Pancreas Segmentation.'' \textit{Medical Image Computing and Computer-Assisted Intervention (MICCAI)}, pp. 556--564.
+
+\bibitem{b15} Alsalem, M. A., Zaidan, A. A., Zaidan, B. B., Hashim, M., Albahri, O. S., Albahri, A. S., et al. (2023). ``Osteo-NeT: An Automated System for Predicting Knee Osteoarthritis from X-ray Images Using Transfer-Learning-Based Neural Networks Approach.'' \textit{Healthcare}, vol. 11, no. 9, p. 1206. PMC10178688.
+
+% Medical Imaging con Deep Learning
+\bibitem{b16} Xu, Y., Wang, Y., Yuan, J., Cheng, Q., Wang, X., \& Carson, P. L. (2019). ``Medical Breast Ultrasound Image Segmentation by Machine Learning.'' \textit{Ultrasonics}, vol. 91, pp. 1--9.
+
+\bibitem{b17} Setio, A. A. A., Ciompi, F., Litjens, G., Gerke, P., Jacobs, C., van Riel, S. J., et al. (2016). ``Pulmonary Nodule Detection in CT Images: False Positive Reduction Using Multi-View Convolutional Networks.'' \textit{IEEE Transactions on Medical Imaging}, vol. 35, no. 5, pp. 1160--1169.
+
+\bibitem{b18} Johnson, A. E. W., Pollard, T. J., Berkowitz, S. J., Greenbaum, N. R., Lungren, M. P., Deng, C.-Y., et al. (2019). ``MIMIC-CXR, a de-identified publicly available database of chest radiographs with free-text reports.'' \textit{Scientific Data}, vol. 6, no. 1, p. 317.
+
+\end{thebibliography}
+
+\end{document}

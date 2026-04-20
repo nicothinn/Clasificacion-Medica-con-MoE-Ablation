@@ -25,6 +25,7 @@ build/
 *.swp
 *.swo
 *~
+!README.md
 
 # OS
 .DS_Store
