@@ -33,7 +33,7 @@ proyecto-2/
 |-- notebooks/
 |   |-- 01_Exploracion_Estructura_Datasets.ipynb
 |   |-- 02_Preprocesamiento_Multiple_Adaptive.ipynb
-|   |-- 03_Pipeline_Router_MoE.ipynb           <-- Pipeline principal del MoE
+|   |-- 03_Pipeline_Router_MoE.ipynb           <-- Definicion Pipeline principal del MoE
 |   |-- 04_Entrenamiento_MoE_Fases.ipynb
 |   |-- 05_Router_Vit_Lineal_Solo.ipynb        <-- Router ViT + Linear (con feedback)
 |   |-- 06_Ablation_Study_Statistical_Routers.ipynb  <-- Ablation obligatorio (4 metodos)
@@ -71,14 +71,8 @@ proyecto-2/
 |   |-- requirements.txt
 |   `-- static/                    <-- HTML/CSS/JS del panel web
 |
-|-- data/                          <-- Datasets (NO versionados, ver .gitignore)
-|-- weights/                       <-- Checkpoints (NO versionados)
-|-- docs/                          <-- Documentacion interna
-|-- guides/                        <-- Papers y apuntes de referencia
-`-- scripts/                       <-- Utilidades auxiliares
 ```
 
-> **Nota:** Los directorios `data/`, `weights/`, `docs/` y `guides/` estan excluidos del repositorio por `.gitignore`. Los pesos se almacenan en Google Drive bajo `PROYECTO_MOE_VISION/03_Weights/`.
 
 ---
 
@@ -137,10 +131,10 @@ Ejecutar **en orden** los notebooks de `notebooks/experts/`:
 | Orden | Notebook | Experto | Tiempo aprox. |
 |------:|----------|---------|---------------|
 | 1 | `NIH_ChestXray_Swin_Tiny_Training.ipynb` | Exp 1: Swin-Tiny (NIH, 5 cls) | ~3-4 h |
-| 2 | `ISIC2019_EfficientNetB3_Training_Final.ipynb` | Exp 2: EfficientNet-B3 (ISIC, 8 cls) | ~1-2 h |
-| 3 | `Osteoarthritis_VGG16BN_Training.ipynb` | Exp 3: VGG-16 BN (Osteo, 5 cls KL) | ~1 h |
+| 2 | `ISIC2019_EfficientNetB3_Training_Final.ipynb` | Exp 2: EfficientNet-B3 (ISIC, 8 cls) | ~3-4 h |
+| 3 | `Osteoarthritis_VGG16BN_Training.ipynb` | Exp 3: VGG-16 BN (Osteo, 5 cls KL) | ~3 h |
 | 4 | `LUNA16_R3D18_Training.ipynb` | Exp 4: R3D-18 (LUNA16, binario 3D) | ~4-6 h |
-| 5 | `Pancreas_R3D18_Training.ipynb` | Exp 5: R3D-18 (Pancreas, binario 3D) | ~2-3 h |
+| 5 | `Pancreas_R3D18_Training.ipynb` | Exp 5: R3D-18 (Pancreas, binario 3D) | ~4-6 h |
 
 Los checkpoints se guardan automaticamente en `03_Weights/` en Drive.
 
