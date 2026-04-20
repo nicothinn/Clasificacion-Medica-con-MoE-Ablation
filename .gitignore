@@ -78,3 +78,14 @@ weights/
 
 # Bloqueos temporales de Microsoft Office
 ~$*
+
+# Documentación local (no subir en push)
+guides/
+docs/
+**/guides/
+**/docs/
+*.docx
+*.pdf
+*.md
+!README.md
+!readme.md
