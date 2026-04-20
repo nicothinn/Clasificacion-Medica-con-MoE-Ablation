@@ -5,6 +5,7 @@
 **Autores:** Andres Alberto Enriquez (2222055), Nicolas Pena Irurita (2232049), Samuel Patino Lucumi.
 
 ---
+<img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/b267890d-cb0e-4dcc-8d69-0e171fc182b1" />
 
 ## 1. Resumen del proyecto
 
