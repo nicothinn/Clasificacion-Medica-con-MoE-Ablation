@@ -107,12 +107,53 @@ def generate_real_heatmap(image_pil, attn_weights, patch_grid_size):
     # Normalizar
     attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
 
-    # Interpolar al tamano de la imagen
+    # Interpolar al tamano de la imagen con interpolacion bicubica
     h, w = img_np.shape[:2]
-    attn_map_resized = cv2.resize(attn_map, (w, h),
-                                  interpolation=cv2.INTER_CUBIC)
+    attn_map_resized = cv2.resize(attn_map, (w, h), interpolation=cv2.INTER_CUBIC)
 
-    return overlay_heatmap(img_np, attn_map_resized)
+    # Filtro Gaussiano para suavizar las manchas agresivamente
+    attn_map_blur = cv2.GaussianBlur(attn_map_resized, (75, 75), 0)
+
+    # Normalizacion Min-Max a [0, 1] estricto
+    attn_map_blur = (attn_map_blur - attn_map_blur.min()) / (attn_map_blur.max() - attn_map_blur.min() + 1e-8)
+
+    return overlay_heatmap(img_np, attn_map_blur)
+
+
+def generate_real_heatmap_3d(image_pil, attn_weights, patch_grid_size_3d=(8, 8, 8)):
+    """
+    Genera un heatmap REAL para volúmenes 3D realizando slice matching.
+    Extrae el corte central del volumen de atención 3D y lo mapea al corte 2D de la imagen original.
+    """
+    img_np = np.array(image_pil)
+    if img_np.ndim == 2:
+        img_np = np.stack([img_np] * 3, axis=-1)
+
+    if attn_weights.ndim == 4:
+        attn_weights = attn_weights[0]
+
+    attn = attn_weights.mean(dim=0)
+    cls_attn = attn[0, 1:].detach().cpu().numpy()
+
+    num_patches = patch_grid_size_3d[0] * patch_grid_size_3d[1] * patch_grid_size_3d[2]
+    cls_attn = cls_attn[:num_patches]
+    attn_vol = cls_attn.reshape(patch_grid_size_3d)  # [Z, Y, X]
+
+    # 1. Selección de Corte (Slice Matching)
+    z_index = patch_grid_size_3d[0] // 2
+    attn_slice = attn_vol[z_index]  # Corte 2D de atención (ej. 8x8)
+
+    # 2. Redimensionamiento 2D a 2D al tamaño de la imagen original mostrada
+    h, w = img_np.shape[:2]
+    attn_slice_resized = cv2.resize(attn_slice, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    # 3. Suavizado 2D agresivo (manchas continuas)
+    attn_map_blur = cv2.GaussianBlur(attn_slice_resized, (75, 75), 0)
+
+    # 4. Normalización estricta y fusión
+    attn_map_blur = (attn_map_blur - attn_map_blur.min()) / (attn_map_blur.max() - attn_map_blur.min() + 1e-8)
+
+    return overlay_heatmap(img_np, attn_map_blur, alpha=0.5)
 
 
 def overlay_heatmap(image_np, heatmap, alpha=0.45, colormap=cv2.COLORMAP_JET):

@@ -31,7 +31,7 @@ from real_models import (
 )
 from mock_models import EXPERT_INFO
 from preprocessing import AdaptivePreprocessor, get_display_image
-from heatmap_utils import generate_mock_heatmap, generate_real_heatmap
+from heatmap_utils import generate_mock_heatmap, generate_real_heatmap, generate_real_heatmap_3d
 from ood_utils import detect_ood
 
 # ======================================================================
@@ -267,12 +267,12 @@ class MoEInferenceEngine:
             return t.to(self.device)
 
     @torch.no_grad()
-    def run(self, uploaded_file, source="unknown") -> InferenceResult:
+    def run(self, uploaded_files, source="unknown") -> InferenceResult:
         """
         Ejecuta el pipeline completo de inferencia.
 
         Args:
-            uploaded_file: archivo subido via st.file_uploader
+            uploaded_files: archivo subido via API, puede ser una lista
             source: origen del dataset (e.g. 'nih', 'osteo', 'pancreas')
 
         Returns:
@@ -284,8 +284,8 @@ class MoEInferenceEngine:
         # ---- 1. Preprocesamiento ----
         # tensor_raw está en rango [0, 1] (sin normalización ImageNet)
         t0 = time.perf_counter()
-        tensor_raw, original_shape, is_3d = self.preprocessor.process_uploaded_file(
-            uploaded_file, source=source
+        tensor_raw, original_shape, is_3d, main_file = self.preprocessor.process_uploaded_file(
+            uploaded_files, source=source
         )
         result.preprocess_ms = (time.perf_counter() - t0) * 1000
         result.original_shape = original_shape
@@ -293,8 +293,12 @@ class MoEInferenceEngine:
         result.is_3d = is_3d
 
         # Imagen para mostrar en el dashboard
-        uploaded_file.seek(0)
-        result.display_image = get_display_image(uploaded_file, tensor_raw, is_3d)
+        if hasattr(main_file, "file"):
+            main_file.file.seek(0)
+            result.display_image = get_display_image(main_file.file, tensor_raw, is_3d)
+        else:
+            main_file.seek(0)
+            result.display_image = get_display_image(main_file, tensor_raw, is_3d)
 
         # ---- 2. Router ----
         # Aplicar normalización específica del Router (ImageNet para 2D)
@@ -349,17 +353,29 @@ class MoEInferenceEngine:
                 )
             else:
                 # Heatmap real con atención del ViT (consigna #18)
-                try:
-                    result.heatmap_image = generate_real_heatmap(
-                        result.display_image,
-                        attn_weights,
-                        patch_grid_size=(14, 14),
-                    )
-                except Exception:
-                    # Fallback al mock si falla
-                    result.heatmap_image = generate_mock_heatmap(
-                        result.display_image, attn_weights
-                    )
+                if is_3d:
+                    try:
+                        result.heatmap_image = generate_real_heatmap_3d(
+                            result.display_image,
+                            attn_weights,
+                            patch_grid_size_3d=(8, 8, 8),
+                        )
+                    except Exception:
+                        result.heatmap_image = generate_mock_heatmap(
+                            result.display_image, attn_weights
+                        )
+                else:
+                    try:
+                        result.heatmap_image = generate_real_heatmap(
+                            result.display_image,
+                            attn_weights,
+                            patch_grid_size=(14, 14),
+                        )
+                    except Exception:
+                        # Fallback al mock si falla
+                        result.heatmap_image = generate_mock_heatmap(
+                            result.display_image, attn_weights
+                        )
 
         # ---- 6. Timing total ----
         result.total_ms = (time.perf_counter() - t_start) * 1000

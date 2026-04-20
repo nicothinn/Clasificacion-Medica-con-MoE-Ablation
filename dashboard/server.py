@@ -42,18 +42,16 @@ def pil_to_base64(img):
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+from typing import List
+
 @app.post("/api/predict")
-async def predict(file: UploadFile = File(...), source: str = Form("unknown")):
+def predict(files: List[UploadFile] = File(...), source: str = Form("unknown")):
     global engine
     if engine is None:
         return JSONResponse(content={"success": False, "error": "Engine not initialized"}, status_code=500)
 
-    contents = await file.read()
-    file_obj = io.BytesIO(contents)
-    file_obj.name = file.filename
-    
     try:
-        result = engine.run(file_obj, source=source)
+        result = engine.run(files, source=source)
         
         response_data = {
             "success": True,
