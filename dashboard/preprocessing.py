@@ -76,25 +76,57 @@ class AdaptivePreprocessor:
     @staticmethod
     def apply_conditional_clahe(img_pil: Image.Image) -> np.ndarray:
         """
-        Detecta si la imagen es escala de grises y aplica CLAHE condicionalmente.
-        Si es RGB (color real), no aplica CLAHE para no distorsionar colores.
+        Detecta si la imagen es médica/grayscale (NIH, Osteo) y aplica CLAHE adaptativo
+        siguiendo la lógica del notebook 05_Router_Vit_Lineal_Solo.
         """
         arr_rgb = np.array(img_pil.convert("RGB"))
         
-        # Deteccion de escala de grises:
-        # Calculamos la varianza entre los canales R, G, B para cada pixel
-        # Si la imagen es grayscale, R=G=B, por lo que la varianza es ~0.
-        channel_var = np.var(arr_rgb, axis=2).mean()
-        is_grayscale = channel_var < 5.0  # Umbral bajo para tolerar artefactos de compresion
+        # Detección de escala de grises vía comparación de canales
+        # Si la diferencia promedio entre canales es mínima, es grayscale médico
+        diff_rg = np.abs(arr_rgb[:,:,0].astype(np.float32) - arr_rgb[:,:,1].astype(np.float32)).mean()
+        diff_rb = np.abs(arr_rgb[:,:,0].astype(np.float32) - arr_rgb[:,:,2].astype(np.float32)).mean()
+        
+        is_grayscale = (diff_rg < 2.0 and diff_rb < 2.0)
         
         if is_grayscale:
-            # Aplicar CLAHE a la imagen médica en escala de grises (Rayos X, Osteo, etc.)
+            # Lógica exacta del Notebook 05: CLAHE adaptativo con tile_size dinámico
             gray = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            return np.repeat(enhanced[:, :, None], 3, axis=2)
+            hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+            
+            # Cálculo de peaks para tile_size dinámico (Notebook 05, §5.2)
+            peaks = int(np.sum(hist > hist.mean()))
+            tile_size = max(2, int(np.ceil(np.log(max(peaks, 2)))))
+            
+            # Cálculo de clipLimit adaptativo
+            valleys = hist[hist <= hist.mean()]
+            val_mean = float(valleys.mean()) if len(valleys) > 0 else 1.0
+            clip = float(np.clip(hist.max() / (val_mean + 1e-6), 1.0, 4.0))
+            
+            # Heurística: si la imagen ya tiene alto contraste (std > 40), 
+            # bajamos el clipLimit para no saturar.
+            img_std = np.std(gray)
+            if img_std > 40.0:
+                clip = min(clip, 1.5)
+            
+            # 2. Aplicar CLAHE según variante (NIH/Osteo)
+            if peaks < 50: 
+                # Variante Osteo (Notebook 05, _clahe_osteo_gray_to_rgb)
+                clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile_size, tile_size))
+                enhanced = clahe.apply(gray)
+                arr_eq = np.repeat(enhanced[:, :, None], 3, axis=2)
+            else:
+                # Variante NIH (Notebook 05, _clahe_nih_rgb)
+                lab = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile_size, tile_size))
+                l_eq = clahe.apply(l)
+                lab_eq = cv2.merge((l_eq, a, b))
+                arr_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+            
+            # Estabilización con Desenfoque Gaussiano (5x5, sigma 1.0) — EXACTO al training
+            return cv2.GaussianBlur(arr_eq, (5, 5), sigmaX=1.0)
         else:
-            # Si es imagen a color RGB (Dermatología), omitir CLAHE por completo
+            # Dermatología (ISIC) o color natural: dejar tal cual
             return arr_rgb
 
 
@@ -212,13 +244,12 @@ class AdaptivePreprocessor:
         original_shape = (img.width, img.height, 3)
         img = img.resize(self.size_2d)
         
-        # IMAGEN INFERENCIA: estrictamente sin CLAHE para evitar domain shift
-        arr = np.array(img, dtype=np.uint8)
+        # APLICAR CLAHE CONDICIONAL: Crítico para NIH (X-rays) y Osteo (Knee)
+        # para que coincida con la distribución de entrenamiento de los expertos y el router.
+        arr = AdaptivePreprocessor.apply_conditional_clahe(img)
             
         t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
-        # NO aplicar ImageNet norm aquí: el Router necesita [0,1] crudo.
-        # La normalización ImageNet se aplica por separado para cada experto
-        # en moe_inference._prepare_expert_tensor().
+        # NO aplicar ImageNet norm aquí (se hace en moe_inference.py de forma específica)
         return t, original_shape, False
 
     def _process_nifti_bytes(self, file_bytes, filename, source):
@@ -310,19 +341,18 @@ class AdaptivePreprocessor:
             amin, amax = float(np.nanmin(img_arr)), float(np.nanmax(img_arr))
 
         pre_norm = amax <= 1.5 and amin >= -1e-2 and ('pancreas' in filename.lower() or source == 'pancreas')
+        # LUNA16/CT suelen venir en HU (-1000 a 400 es el estándar del notebook 05)
+        hu_min, hu_max = -1000, 400
         
-        if not pre_norm:
-            # Ventana radiológica para Pulmón/Tórax (ej. LUNA16)
-            img_arr = np.clip(img_arr, self.hu_min, self.hu_max)
-            img_arr = (img_arr - self.hu_min) / (self.hu_max - self.hu_min + 1e-8)
-        else:
+        # Si el volumen ya parece normalizado [0, 1] (común en Pancreas), saltamos
+        if img_arr.max() <= 1.5 and img_arr.min() >= -0.1:
             img_arr = np.clip(img_arr, 0.0, 1.0)
-
-        # Convertir a tensor y resize
-        t = torch.tensor(img_arr, dtype=torch.float32)
-        t = t.unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
-        t = F.interpolate(t, size=self.size_3d, mode="trilinear",
-                          align_corners=False)
+        else:
+            img_arr = np.clip(img_arr, hu_min, hu_max)
+            img_arr = (img_arr - hu_min) / (hu_max - hu_min + 1e-8)
+        
+        t = torch.from_numpy(img_arr.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=self.size_3d, mode="trilinear", align_corners=False)
         return t.squeeze(0)  # [1, 64, 64, 64]
 
 

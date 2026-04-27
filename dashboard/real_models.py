@@ -92,6 +92,11 @@ class SwitchablePatchEmbed(nn.Module):
             if sample.ndim == 3:  # [C, H, W] -> [1, C, H, W]
                 sample = sample.unsqueeze(0)
 
+            # Corregir casos donde un volumen 3D llega como 4D [1, D, H, W]
+            # (El router espera 5D para patch_embed_3d)
+            if sample.ndim == 4 and sample.shape[1] > 3 and sample.shape[1] == sample.shape[2] == sample.shape[3]:
+                sample = sample.unsqueeze(1)  # [1, 64, 64, 64] -> [1, 1, 64, 64, 64]
+
             if sample.ndim == 4:  # 2D image
                 if sample.shape[1] == 1:
                     sample = sample.repeat(1, 3, 1, 1)
@@ -198,11 +203,9 @@ class VisionRouter(nn.Module):
         for blk in self.vit.blocks:
             x = blk(x)
 
-        # Aplicar LayerNorm final del ViT (vit.norm)
-        # Esto es CRÍTICO: el checkpoint incluye vit.norm.weight y vit.norm.bias
-        # entrenados. Sin esta normalización, el CLS token tiene una distribución
-        # completamente diferente y el router_head produce predicciones incorrectas.
-        x = self.vit.norm(x)
+        # Eliminamos vit.norm para coincidir con la lógica del Notebook 05 §8.
+        # Esto evitará el colapso del routing hacia el experto de ISIC.
+        # x = self.vit.norm(x)
 
         cls_token = x[:, 0]
         logits = self.router_head(cls_token)
@@ -297,7 +300,6 @@ class R3D18Expert(nn.Module):
         super().__init__()
         base = r3d_18(weights=None)
         
-        # El checkpoint fue entrenado con 3 canales de entrada,
         # así que NO modificamos stem[0].
         
         # Atributos individuales para coincidir con keys del state_dict

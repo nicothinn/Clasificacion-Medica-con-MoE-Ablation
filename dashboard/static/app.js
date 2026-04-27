@@ -58,6 +58,45 @@ document.addEventListener('DOMContentLoaded', () => {
         return entropia;
     }
 
+    // Batch Navigation State
+    let batchResults = [];
+    let currentBatchIndex = 0;
+
+    const btnPrev = document.getElementById('btn-prev-batch');
+    const btnNext = document.getElementById('btn-next-batch');
+    const batchCounter = document.getElementById('batch-counter');
+    const batchNavCard = document.getElementById('batch-nav-card');
+
+    if (btnPrev && btnNext) {
+        btnPrev.addEventListener('click', () => {
+            if (currentBatchIndex > 0) {
+                currentBatchIndex--;
+                updateDashboard(batchResults[currentBatchIndex]);
+                updateBatchCounter();
+            }
+        });
+        btnNext.addEventListener('click', () => {
+            if (currentBatchIndex < batchResults.length - 1) {
+                currentBatchIndex++;
+                updateDashboard(batchResults[currentBatchIndex]);
+                updateBatchCounter();
+            }
+        });
+    }
+
+    function updateBatchCounter() {
+        if (batchResults.length > 1) {
+            batchNavCard.classList.remove('hidden');
+            batchCounter.textContent = `Imagen ${currentBatchIndex + 1} de ${batchResults.length}`;
+            btnPrev.style.opacity = currentBatchIndex === 0 ? '0.5' : '1';
+            btnNext.style.opacity = currentBatchIndex === batchResults.length - 1 ? '0.5' : '1';
+            btnPrev.style.pointerEvents = currentBatchIndex === 0 ? 'none' : 'auto';
+            btnNext.style.pointerEvents = currentBatchIndex === batchResults.length - 1 ? 'none' : 'auto';
+        } else {
+            batchNavCard.classList.add('hidden');
+        }
+    }
+
     // Tabs
     tabs.forEach(tab => {
         tab.addEventListener('click', () => {
@@ -107,6 +146,24 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        // Agrupar tareas: si es MHD, va todo junto. Si no, cada archivo es independiente (Batch).
+        let tasks = [];
+        if (hasMhd) {
+            tasks.push(files);
+        } else {
+            files.forEach(f => tasks.push([f]));
+        }
+
+        const modeRadios = document.getElementsByName('op_mode');
+        let opMode = 'auto';
+        for (let r of modeRadios) {
+            if (r.checked) { opMode = r.value; break; }
+        }
+
+        batchResults = [];
+        currentBatchIndex = 0;
+        if (batchNavCard) batchNavCard.classList.add('hidden');
+
         // UI Transition
         emptyState.classList.add('hidden');
         resultsState.classList.add('hidden');
@@ -114,61 +171,79 @@ document.addEventListener('DOMContentLoaded', () => {
         loadingIndicator.classList.remove('hidden');
 
         systemLog.innerHTML = '';
-        const mainFile = files.find(f => !f.name.toLowerCase().endsWith('.raw') && !f.name.toLowerCase().endsWith('.zraw')) || files[0];
-        const shortName = mainFile.name.length > 25 ? mainFile.name.substring(0, 22) + '...' : mainFile.name;
-        agregarAlLog(`Procesando ${files.length} archivo(s): ${shortName}`, 'info');
-        
-        setTimeout(() => {
-            const is3D = files.some(f => f.name.toLowerCase().match(/\.(nii|nii\.gz|mha|mhd)$/));
-            agregarAlLog(`Extrayendo features ${is3D ? '3D' : '2D'}...`, 'info');
-        }, 300);
-
-        const formData = new FormData();
-        files.forEach(f => {
-            formData.append("files", f); // Cambiado a 'files' plural
-        });
-        
-        // Debugging frontend: verificar qué archivos van en el FormData
-        const archivosAdjuntos = formData.getAll("files").map(f => f.name);
-        console.log("Archivos adjuntos en FormData:", archivosAdjuntos);
-        
-        // Get clinical source if specified (or default to 'unknown')
-        const sourceSelect = document.getElementById('data-source');
-        if (sourceSelect) {
-            formData.append("source", sourceSelect.value);
-        } else {
-            formData.append("source", "unknown");
+        if (tasks.length > 1) {
+            agregarAlLog(`Iniciando procesamiento de batch en modo ${opMode.toUpperCase()}: ${tasks.length} imagen(es)...`, 'warning');
         }
 
-        try {
-            const response = await fetch('/api/predict', {
-                method: 'POST',
-                body: formData
-            });
-            const data = await response.json();
+        for (let i = 0; i < tasks.length; i++) {
+            const currentFiles = tasks[i];
+            const mainFile = currentFiles.find(f => !f.name.toLowerCase().endsWith('.raw') && !f.name.toLowerCase().endsWith('.zraw')) || currentFiles[0];
+            const shortName = mainFile.name.length > 25 ? mainFile.name.substring(0, 22) + '...' : mainFile.name;
             
-            if (data.success) {
-                updateDashboard(data);
-                
-                // Update stats
-                totalInferences++;
-                document.getElementById('total-inferences').textContent = totalInferences;
-                loadCounts[data.expert_id]++;
-                updateLoadBalance();
-                
+            if (tasks.length > 1) {
+                agregarAlLog(`[${i+1}/${tasks.length}] Extrayendo features de: ${shortName}`, 'info');
             } else {
-                alert("Error en la inferencia: " + data.error);
-                emptyState.classList.remove('hidden');
+                agregarAlLog(`Procesando archivo: ${shortName}`, 'info');
+                setTimeout(() => {
+                    const is3D = currentFiles.some(f => f.name.toLowerCase().match(/\.(nii|nii\.gz|mha|mhd)$/));
+                    agregarAlLog(`Identificado como volumen ${is3D ? '3D' : '2D'}`, 'info');
+                }, 300);
             }
-        } catch (error) {
-            console.error("Error:", error);
-            alert("Error de conexión al servidor.");
-            emptyState.classList.remove('hidden');
-        } finally {
-            loadingIndicator.classList.add('hidden');
-            uploadZone.classList.remove('hidden');
-            fileInput.value = ""; // Reset input
+
+            const formData = new FormData();
+            currentFiles.forEach(f => formData.append("files", f));
+            
+            const sourceSelect = document.getElementById('data-source');
+            formData.append("source", sourceSelect ? sourceSelect.value : "unknown");
+
+            try {
+                const response = await fetch('/api/predict', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    batchResults.push(data);
+                    
+                    // Update stats in background
+                    totalInferences++;
+                    document.getElementById('total-inferences').textContent = totalInferences;
+                    loadCounts[data.expert_id]++;
+                    updateLoadBalance();
+                    appendToHistory(data, totalInferences);
+                    
+                    agregarAlLog(`Predicción: ${data.class_label} (${(data.confidence * 100).toFixed(1)}%)`, 'success');
+                    
+                    if (opMode === 'auto') {
+                        updateDashboard(data);
+                        if (tasks.length > 1 && i < tasks.length - 1) {
+                            await new Promise(r => setTimeout(r, 1200));
+                        }
+                    } else {
+                        // Manual Mode
+                        if (i === 0) {
+                            updateDashboard(data);
+                            updateBatchCounter();
+                        }
+                    }
+                } else {
+                    agregarAlLog(`Error en ${shortName}: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                console.error("Error:", error);
+                agregarAlLog(`Error de conexión procesando ${shortName}.`, 'error');
+            }
         }
+        
+        if (opMode === 'manual' && tasks.length > 1) {
+            updateBatchCounter();
+            agregarAlLog(`Batch finalizado. Use los botones para navegar.`, 'warning');
+        }
+
+        loadingIndicator.classList.add('hidden');
+        uploadZone.classList.remove('hidden');
+        fileInput.value = ""; // Reset input
     }
 
     const ROUTING_PATHS = [
@@ -223,17 +298,18 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('img-meta').textContent = 
             `${dimStr} | Original: ${data.original_shape.join('x')} | Adaptado: ${data.processed_shape.join('x')}`;
 
-        // OOD — calculate entropy using JS
+        // OOD — use backend calculation
         const oodAlert = document.getElementById('ood-alert');
-        const calculatedEntropy = calcularEntropia(data.gating_scores);
-        const isOOD = calculatedEntropy > UMBRAL_OOD_DEFAULT;
+        const calculatedEntropy = data.entropy;
+        const isOOD = data.is_ood;
+        const currentThreshold = data.ood_threshold;
         
         const predCard = document.getElementById('pred-card');
 
         if (isOOD) {
             oodAlert.classList.remove('hidden');
             document.getElementById('ood-details').textContent = 
-                `Entropía: ${calculatedEntropy.toFixed(3)} nats • Umbral: ${UMBRAL_OOD_DEFAULT.toFixed(3)}`;
+                `Entropía: ${calculatedEntropy.toFixed(3)} nats • Umbral: ${currentThreshold.toFixed(3)}`;
             agregarAlLog(`Entropía: ${calculatedEntropy.toFixed(3)} nats (ALERTA OOD)`, 'error');
             
             // Block prediction card
@@ -247,7 +323,6 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('conf-wrapper').classList.add('hidden');
         } else {
             oodAlert.classList.add('hidden');
-            agregarAlLog(`Entropía: ${calculatedEntropy.toFixed(3)} nats`, 'success');
             
             // Reset prediction card
             predCard.style.opacity = '1';
@@ -255,16 +330,6 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('ood-explainer').classList.add('hidden');
             document.getElementById('conf-wrapper').classList.remove('hidden');
         }
-
-        setTimeout(() => {
-            agregarAlLog(`Ruteo completado -> Experto ${data.expert_id}`, 'info');
-            agregarAlLog(`Inferencia en ${data.expert_arch}...`, 'info');
-        }, 500);
-
-        setTimeout(() => {
-            agregarAlLog(`Predicción: ${data.class_label} (${(data.confidence * 100).toFixed(1)}%)`, 'success');
-            agregarAlLog(`Latencia total: ${data.total_ms.toFixed(1)} ms`, 'warning');
-        }, 800);
 
         // Prediction
         const predLabel = document.getElementById('pred-label');
@@ -343,15 +408,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 </tr>
             `;
         });
+    }
 
-        // History Table Update
+    function appendToHistory(data, infIndex) {
         const historyTbody = document.getElementById('history-tbody');
+        const isOOD = data.is_ood;
         const oodBadge = isOOD ? '<span class="badge-table badge-ood">Sí</span>' : '<span class="badge-table badge-ok">No</span>';
         
-        // prepend to show latest first
         const newRow = document.createElement('tr');
         newRow.innerHTML = `
-            <td>${totalInferences}</td>
+            <td>${infIndex}</td>
             <td>${data.is_3d ? 'Volumen 3D' : 'Imagen 2D'}</td>
             <td style="font-weight: 600;">${data.class_label}</td>
             <td style="font-family: monospace;">${(data.confidence * 100).toFixed(1)}%</td>

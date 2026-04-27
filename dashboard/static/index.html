@@ -40,6 +40,18 @@
                     <p class="loading-text">Analizando muestra anatómica...</p>
                 </div>
 
+                <div class="section-title">Modo de Operación</div>
+                <div class="mode-selector" style="display: flex; gap: 10px; margin-bottom: 15px; font-size: 0.8rem;">
+                    <label style="cursor:pointer; display:flex; align-items:center; gap:5px;">
+                        <input type="radio" name="op_mode" value="auto" checked>
+                        <span>Auto-Play</span>
+                    </label>
+                    <label style="cursor:pointer; display:flex; align-items:center; gap:5px;" title="Permite navegar imagen por imagen para analizar heatmaps">
+                        <input type="radio" name="op_mode" value="manual">
+                        <span>Análisis Manual</span>
+                    </label>
+                </div>
+
                 <div class="divider"></div>
                 
                 <div class="section-title">Arquitectura de Enrutamiento</div>
@@ -123,6 +135,14 @@
             </div>
 
             <div class="dashboard-grid hidden" id="results-state">
+                
+                <!-- Batch Navigation Controls -->
+                <div class="grid-col span-12 card hidden" id="batch-nav-card" style="display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: #E8E3D3; border: 1px solid #1F3330;">
+                    <button id="btn-prev-batch" style="cursor:pointer; padding: 5px 15px; background: #1F3330; color: white; border: none; border-radius: 4px;">⬅ Anterior</button>
+                    <span id="batch-counter" style="font-weight: 600; color: #1F3330; font-family: monospace; font-size: 1.1rem;">Imagen 1 de 5</span>
+                    <button id="btn-next-batch" style="cursor:pointer; padding: 5px 15px; background: #1F3330; color: white; border: none; border-radius: 4px;">Siguiente ➡</button>
+                </div>
+
                 <!-- OOD Alert Full Width -->
                 <div class="ood-alert hidden" id="ood-alert">
                     <div class="ood-icon"><i data-lucide="alert-triangle"></i></div>
@@ -273,7 +293,7 @@
             </div>
         </main>
     </div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=4"></script>
     <script>
         lucide.createIcons();
     </script>

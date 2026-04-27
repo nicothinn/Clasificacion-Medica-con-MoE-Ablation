@@ -27,7 +27,7 @@ import torch
 # Constantes
 NUM_EXPERTS = 5
 MAX_ENTROPY = np.log(NUM_EXPERTS)  # log(5) ~ 1.609 nats
-DEFAULT_OOD_THRESHOLD_RATIO = 0.85  # 85% de la entropia maxima
+DEFAULT_OOD_THRESHOLD_RATIO = 1.0  # 100% de la entropia maxima (Deshabilita el OOD por entropia)
 
 
 def compute_entropy(gating_probs):

@@ -190,15 +190,23 @@ class MoEInferenceEngine:
         """
         Prepara el tensor para el Router.
         
-        El Router recibe tensores en rango [0, 1] (con CLAHE si aplica).
-        NO se aplica ImageNet norm aquí — el checkpoint router_professor_fase3_only.pth
-        colapsa a ISIC si recibe tensores normalizados con ImageNet.
+        Para el checkpoint router_professor_fase3_only.pth, es CRÍTICO
+        aplicar ImageNet norm en 2D (con CLAHE previo ya aplicado por el preprocesador)
+        para que el routing sea exacto.
         """
         t = tensor_raw.to(self.device)
-        if t.ndim == 3:
-            t = t.unsqueeze(0)
-        elif t.ndim == 4 and is_3d:
-            t = t.unsqueeze(0)
+        
+        if not is_3d:
+            # El router fue entrenado con ImageNet norm para 2D.
+            # tensor_raw ya trae CLAHE si es medical/grayscale.
+            t = AdaptivePreprocessor.apply_imagenet_norm(t)
+            if t.ndim == 3:
+                t = t.unsqueeze(0)
+        else:
+            # Para 3D, el router recibe el volumen en [0, 1] interpolado a 64x64x64
+            if t.ndim == 4:
+                t = t.unsqueeze(0)
+                
         return t
 
     def luna_1ch_to_kinetics_3ch(self, t):
@@ -307,8 +315,10 @@ class MoEInferenceEngine:
         gating_logits, cls_token, attn_weights = self.router(router_tensor)
         result.router_ms = (time.perf_counter() - t0) * 1000
 
-        # Softmax de los gating scores
-        gating_probs = F.softmax(gating_logits, dim=-1).squeeze(0)
+        # Softmax de los gating scores con Temperatura=1.0
+        # (Temperatura mayor a 1 aumenta artificialmente la entropía y causa falsos OOD)
+        temperature = 1.0
+        gating_probs = F.softmax(gating_logits / temperature, dim=-1).squeeze(0)
         result.gating_scores = gating_probs.cpu().numpy()
 
         # Seleccion Top-1
@@ -344,6 +354,20 @@ class MoEInferenceEngine:
         result.class_index = int(class_probs.argmax())
         result.confidence = float(class_probs.max())
         result.class_label = info["class_names"][result.class_index]
+
+        # ---- Detección OOD Secundaria y de Contradicción de Dominio ----
+        if not result.is_ood:
+            # 1. Contradicción de Dominio (Imágenes Color -> Expertos Rayos-X)
+            # tensor_raw para 2D viene en [3, H, W]. Si fue preprocesada con CLAHE, 
+            # los 3 canales serán casi idénticos.
+            if not is_3d:
+                diff_rg = torch.abs(tensor_raw[0] - tensor_raw[1]).mean().item()
+                is_color = diff_rg > 0.05
+                # Si es una imagen claramente a color, pero se asignó a NIH o Osteo...
+                if is_color and expert_id in [0, 2]:
+                    result.is_ood = True
+                    result.ood_message = "ALERTA OOD: Imagen en color natural rechazada para modelos de Rayos-X."
+            
 
         # ---- 5. Heatmap ----
         if result.display_image is not None:
